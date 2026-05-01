@@ -81,7 +81,7 @@ secure-file-transfer/
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/secure-file-transfer.git
+git https://github.com/Tushar-S-nath/secure-file-transfer.git
 cd secure-file-transfer
 
 # Install the only dependency
