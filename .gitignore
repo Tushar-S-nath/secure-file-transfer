@@ -20,3 +20,9 @@ keys/*.pem
 # OS
 .DS_Store
 Thumbs.db
+
+# live_replay_attack_demo.py artifacts — regenerated fresh each run
+replay_demo_test_file.bin
+replay_demo_output/
+replay_demo_sender.log
+replay_demo_receiver.log

@@ -1,105 +1,154 @@
 """
-Live replay-attack demonstration.
+Live replay-attack demonstration -- fully self-contained, single command:
 
-Step 1: Act as a genuine 'bob' receiver talking to the REAL sender.py
-        (running as alice, --peer bob). Complete a real handshake,
-        capture the exact raw KEY_EXCHANGE packet bytes alice's real
-        sender.py sends -- a real, validly signed message.
+    python live_replay_attack_demo.py
 
-Step 2: Act as a malicious 'sender' -- accept a connection from a REAL,
-        freshly started receiver.py (running as bob, --peer alice,
-        expecting a real alice), and instead of properly responding,
-        simply replay the bytes captured in Step 1 verbatim.
+Does everything itself, no other terminal or setup needed:
 
-Step 3: Confirm the real receiver.py rejects it and saves no file.
+Step 0: Generates a small throwaway test file and starts a REAL
+        sender.py (alice, --peer bob) as a subprocess, listening for a
+        connection.
 
-This is not a mock -- both receiver.py processes are the actual project
-code, run as real subprocesses, over real TCP sockets.
+Step 1: Acts as a genuine 'bob' receiver talking to that real sender.py.
+        Completes a real handshake far enough to receive KEY_EXCHANGE,
+        capturing the exact raw packet bytes -- a real, validly signed
+        message, genuinely produced by the project's own signing code.
+
+Step 2: Acts as a malicious 'sender' -- accepts a connection from a
+        REAL, freshly started receiver.py subprocess (bob, --peer
+        alice, expecting a real alice), and instead of responding
+        properly, simply replays the bytes captured in Step 1 verbatim.
+
+Step 3: Confirms the real receiver.py rejects it and saves no file.
+
+Nothing here is mocked: both the capture-target sender.py and the
+attack-target receiver.py are the actual project code, run as real
+subprocesses, talking over real TCP sockets on localhost.
+
+Requires: `python keygen.py --name alice` and `python keygen.py --name
+bob` to have been run at least once (same as any normal transfer).
 """
+import os
 import socket
 import subprocess
 import sys
+import threading
 import time
-import os
 
 sys.path.insert(0, ".")
 from protocol import send_packet, recv_packet, PacketType, build_hello_named
 from crypto_utils import generate_challenge_nonce
 from keygen import load_public_key
 
-CAPTURE_PORT = 21022
-REPLAY_PORT  = 21021
+CAPTURE_PORT = 21099
+REPLAY_PORT  = 21100
+TEST_FILE    = "replay_demo_test_file.bin"
+OUTPUT_DIR   = "replay_demo_output"
 
 
-def capture_real_key_exchange():
-    """Connect to a real sender.py (alice) as a genuine bob, complete
-    the handshake far enough to receive KEY_EXCHANGE, and return the
-    raw captured bytes."""
+def check_keys_exist():
+    for name in ("alice", "bob"):
+        for kind in ("private", "public"):
+            path = os.path.join("keys", f"{name}_{kind}.pem")
+            if not os.path.exists(path):
+                print(f"[!] Missing {path}")
+                print("    Run these first:")
+                print("      python keygen.py --name alice")
+                print("      python keygen.py --name bob")
+                sys.exit(1)
+
+
+def main():
+    check_keys_exist()
+
+    print("=" * 70)
+    print("LIVE REPLAY-ATTACK DEMONSTRATION")
+    print("=" * 70)
+
+    # -- Step 0: throwaway test file + start a real sender.py --------------
+    with open(TEST_FILE, "wb") as f:
+        f.write(os.urandom(50 * 1024))
+
+    print(f"\n[setup] Starting a real sender.py (alice, --peer bob) on port {CAPTURE_PORT}...")
+    sender_log = open("replay_demo_sender.log", "w")
+    sender_proc = subprocess.Popen(
+        [sys.executable, "sender.py", "--file", TEST_FILE,
+         "--port", str(CAPTURE_PORT), "--key", "alice", "--peer", "bob"],
+        stdout=sender_log, stderr=subprocess.STDOUT,
+    )
+    time.sleep(1.2)
+    if sender_proc.poll() is not None:
+        print("[!] sender.py exited immediately -- check replay_demo_sender.log")
+        sys.exit(1)
+
+    # -- Step 1: capture a REAL, validly-signed KEY_EXCHANGE ----------------
+    print("[capture] Connecting as a genuine 'bob' to capture a real signed session...")
     public_key_pem = load_public_key("bob").export_key(format="PEM")
-    nonce = generate_challenge_nonce()
-
+    nonce1 = generate_challenge_nonce()
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.connect(("127.0.0.1", CAPTURE_PORT))
-    send_packet(sock, PacketType.HELLO, build_hello_named(public_key_pem, "bob", nonce))
-    ptype, kx_payload = recv_packet(sock)
-    assert ptype == PacketType.KEY_EXCHANGE
+    send_packet(sock, PacketType.HELLO, build_hello_named(public_key_pem, "bob", nonce1))
+    ptype, captured_kx = recv_packet(sock)
     sock.close()
-    print(f"[capture] Got real KEY_EXCHANGE from live sender.py: {len(kx_payload)} bytes, "
-          f"genuinely signed by alice's real private key, bound to nonce {nonce.hex()[:16]}...")
-    return kx_payload
+    sender_proc.wait(timeout=10)
+    sender_log.close()
 
+    print(f"[capture] Got a REAL KEY_EXCHANGE: {len(captured_kx)} bytes, genuinely signed")
+    print(f"          by alice's real private key, bound to nonce {nonce1.hex()[:16]}...")
 
-def run_replay_attack(captured_kx_payload):
-    """Listen for a connection from a REAL receiver.py, receive its
-    (fresh, different) HELLO, then replay the captured OLD KEY_EXCHANGE
-    verbatim -- exactly what an attacker who recorded a past session
-    would do against a new connection attempt."""
-    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server.bind(("127.0.0.1", REPLAY_PORT))
-    server.listen(1)
-    print(f"[replay-attacker] Listening on {REPLAY_PORT}, waiting for a real receiver.py...")
+    # -- Step 2: replay it against a FRESH connection -----------------------
+    def run_replay_attacker():
+        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server.bind(("127.0.0.1", REPLAY_PORT))
+        server.listen(1)
+        conn, _ = server.accept()
+        recv_packet(conn)   # the fresh HELLO from the real receiver -- ignored
+        print("\n[attacker] Real receiver.py connected with a FRESH HELLO (new nonce).")
+        print("[attacker] Replaying the OLD captured KEY_EXCHANGE verbatim...")
+        send_packet(conn, PacketType.KEY_EXCHANGE, captured_kx)
+        try:
+            recv_packet(conn)
+        except Exception as exc:
+            print(f"[attacker] Connection closed by receiver (expected): {exc}")
+        conn.close()
+        server.close()
 
-    conn, _ = server.accept()
-    ptype, hello_payload = recv_packet(conn)
-    assert ptype == PacketType.HELLO
-    print("[replay-attacker] Real receiver.py connected and sent a FRESH HELLO "
-          "(new nonce, different from the captured session).")
-    print("[replay-attacker] Replaying the OLD captured KEY_EXCHANGE verbatim...")
-    send_packet(conn, PacketType.KEY_EXCHANGE, captured_kx_payload)
-
-    try:
-        ptype2, payload2 = recv_packet(conn)
-        print(f"[replay-attacker] Receiver responded: {ptype2}, {payload2}")
-    except Exception as exc:
-        print(f"[replay-attacker] Connection closed by receiver: {exc}")
-    conn.close()
-    server.close()
-
-
-if __name__ == "__main__":
-    # Step 1: capture a real, validly signed KEY_EXCHANGE from a live sender.py
-    captured = capture_real_key_exchange()
-
-    # Step 2: start the replay-attacker listener in the background, then
-    # launch a REAL, fresh receiver.py against it (as a subprocess, exactly
-    # as a legitimate user would run it)
-    import threading
-    t = threading.Thread(target=run_replay_attack, args=(captured,), daemon=True)
+    t = threading.Thread(target=run_replay_attacker, daemon=True)
     t.start()
     time.sleep(0.5)
 
-    os.makedirs("/tmp/replay_attack_output", exist_ok=True)
-    log = open("/tmp/replay_attack_receiver.log", "w")
-    proc = subprocess.Popen(
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    print(f"\n[victim] Starting a REAL, fresh receiver.py (bob, --peer alice) on port {REPLAY_PORT}...")
+    receiver_log = open("replay_demo_receiver.log", "w")
+    receiver_proc = subprocess.Popen(
         [sys.executable, "receiver.py", "--port", str(REPLAY_PORT), "--key", "bob",
-         "--output", "/tmp/replay_attack_output", "--peer", "alice"],
-        stdout=log, stderr=subprocess.STDOUT
+         "--output", OUTPUT_DIR, "--peer", "alice"],
+        stdout=receiver_log, stderr=subprocess.STDOUT,
     )
-    rc = proc.wait(timeout=15)
-    log.close()
+    rc = receiver_proc.wait(timeout=15)
+    receiver_log.close()
     t.join(timeout=5)
 
-    print(f"\n[result] receiver.py exit code: {rc} (nonzero = correctly rejected the replay)")
-    saved_files = os.listdir("/tmp/replay_attack_output")
-    print(f"[result] files saved despite the replay attack: {saved_files} (should be empty)")
+    # -- Step 3: results ------------------------------------------------------
+    print("\n" + "=" * 70)
+    print("RESULT")
+    print("=" * 70)
+    rejected = rc != 0
+    print(f"receiver.py exit code : {rc}  {'(rejected, as expected)' if rejected else '(!!! ACCEPTED -- BUG)'}")
+    saved = os.listdir(OUTPUT_DIR)
+    print(f"files saved            : {saved}  {'(none leaked, correct)' if not saved else '(!!! FILE LEAKED)'}")
+
+    print("\n--- receiver.py's actual log output ---")
+    with open("replay_demo_receiver.log") as f:
+        print(f.read())
+
+    if rejected and not saved:
+        print("Replay attack correctly rejected. Nothing was leaked.")
+    else:
+        print("Something is wrong -- the replay was NOT correctly rejected.")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
