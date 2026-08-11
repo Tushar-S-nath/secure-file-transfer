@@ -50,6 +50,8 @@ try:
         compute_sha256,
         unbundle_keys_gcm,
         decrypt_file_stream_gcm,
+        verify_peer_identity,
+        verify_signature,
     )
     from protocol import (
         send_packet,
@@ -59,6 +61,8 @@ try:
         parse_file_header,
         build_ack,
         build_error,
+        build_hello_named,
+        parse_key_exchange_signed,
     )
     from keygen import load_private_key, load_public_key
     from logger import TransferSession, log_info, log_error
@@ -67,6 +71,7 @@ try:
         HandshakeError,
         SessionError,
         IntegrityError,
+        AuthenticationError,
     )
 except ImportError as exc:
     print(f"[FATAL] Missing dependency: {exc}")
@@ -253,6 +258,8 @@ def perform_transfer(
     public_key_pem: bytes,
     output_dir: Path,
     session: TransferSession,
+    peer_name: str = None,
+    own_name: str = None,
 ) -> tuple:
     """
     Execute the full handshake + file reception over an established socket.
@@ -263,6 +270,15 @@ def perform_transfer(
         public_key_pem: Receiver's RSA public key in PEM bytes (sent in HELLO).
         output_dir:     Directory where the received file will be saved.
         session:        TransferSession logger instance.
+        peer_name:      If given, enables MUTUAL AUTHENTICATION: we send a
+                        named HELLO claiming own_name, and require the
+                        sender's KEY_EXCHANGE to be signed by a key
+                        matching the locally trusted copy at
+                        keys/<peer_name>_public.pem. If None (default),
+                        falls back to the original unauthenticated
+                        handshake — unchanged behavior for existing callers.
+        own_name:       This receiver's own identity name (required if
+                        peer_name is set — sent in the named HELLO).
 
     Returns:
         (output_path, stats) where stats is a dict of wall-clock timings
@@ -270,15 +286,66 @@ def perform_transfer(
         recv() calls, decrypt_seconds, hmac_verify_seconds, total_seconds)
         and peak_rss_kb. Used by --bench-report; harmless for normal runs.
     """
+    if peer_name is not None and own_name is None:
+        raise ValueError("peer_name requires own_name (mutual auth needs it for our own HELLO).")
+
     t_start = time.perf_counter()
 
     # ── Step 1: Handshake ───────────────────────────────────────────────────
-    # perform_receiver_handshake(sock, public_key_pem) → encrypted_bundle bytes
-    log_info("Sending HELLO with receiver public key…")
-    try:
-        encrypted_bundle = perform_receiver_handshake(conn, public_key_pem)
-    except Exception as exc:
-        raise HandshakeError(f"Handshake failed: {exc}") from exc
+    if peer_name is not None:
+        # ── Mutual-auth handshake ───────────────────────────────────────
+        log_info(f"Sending named HELLO as '{own_name}' (mutual auth, expecting sender '{peer_name}')…")
+        try:
+            send_packet(conn, PacketType.HELLO, build_hello_named(public_key_pem, own_name))
+            ptype, kx_payload = recv_packet(conn)
+        except Exception as exc:
+            raise HandshakeError(f"Handshake failed: {exc}") from exc
+
+        if ptype != PacketType.KEY_EXCHANGE:
+            raise HandshakeError(f"Expected KEY_EXCHANGE, got {ptype}")
+
+        try:
+            kx = parse_key_exchange_signed(kx_payload)
+        except Exception as exc:
+            raise HandshakeError(
+                f"Failed to parse signed KEY_EXCHANGE — is the sender also "
+                f"using --peer? {exc}"
+            ) from exc
+
+        if kx["sender_name"] != peer_name:
+            raise AuthenticationError(
+                f"Sender claimed identity '{kx['sender_name']}', expected '{peer_name}'.",
+                details="Refusing to proceed — this could be a wrong peer or an impersonation attempt."
+            )
+
+        # Look up the LOCALLY trusted public key for the claimed sender —
+        # the sender's key is never transmitted on the wire in the signed
+        # KEY_EXCHANGE format, deliberately, so this can only ever verify
+        # against a key we already had on file.
+        try:
+            with open(os.path.join("keys", f"{peer_name}_public.pem"), "rb") as f:
+                sender_trusted_pubkey_pem = f.read()
+        except OSError as exc:
+            raise AuthenticationError(
+                f"No trusted public key on file for '{peer_name}'.",
+                details=f"Expected at: keys/{peer_name}_public.pem ({exc})"
+            )
+        from Crypto.PublicKey import RSA as _RSA
+        sender_trusted_pubkey = _RSA.import_key(sender_trusted_pubkey_pem)
+
+        verify_signature(sender_trusted_pubkey, kx["encrypted_bundle"], kx["signature"])
+        log_info(f"✓ Sender identity verified: '{peer_name}'")
+
+        encrypted_bundle = kx["encrypted_bundle"]
+
+    else:
+        # ── Original, unauthenticated handshake (unchanged) ─────────────
+        # perform_receiver_handshake(sock, public_key_pem) → encrypted_bundle bytes
+        log_info("Sending HELLO with receiver public key…")
+        try:
+            encrypted_bundle = perform_receiver_handshake(conn, public_key_pem)
+        except Exception as exc:
+            raise HandshakeError(f"Handshake failed: {exc}") from exc
 
     # Decrypt the RSA bundle, but do NOT unbundle it yet — whether it's a
     # GCM bundle (just an AES key) or a CBC bundle (AES key + HMAC key,
@@ -486,6 +553,7 @@ def run_client(
     key_name: str,
     output_dir: Path,
     bench_report: Optional[Path] = None,
+    peer_name: str = None,
 ):
     """Connect to the sender and run the full secure file reception flow.
 
@@ -494,6 +562,9 @@ def run_client(
             returned by perform_transfer after the transfer finishes —
             success or failure. Used by the benchmark suite; no effect on
             normal transfers when omitted.
+        peer_name: if given, enables mutual authentication — see
+            perform_transfer's docstring. Requires the sender to also
+            use --peer.
     """
 
     print("=" * 60)
@@ -549,7 +620,8 @@ def run_client(
         with sock:
             sock.settimeout(RECV_TIMEOUT)
             output_path, stats = perform_transfer(
-                sock, private_key, public_key_pem, output_dir, session
+                sock, private_key, public_key_pem, output_dir, session,
+                peer_name=peer_name, own_name=key_name if peer_name else None,
             )
 
             print(f"\n  ✓ Transfer complete → {output_path}")
@@ -659,6 +731,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--peer",
+        type=str,
+        default=None,
+        metavar="NAME",
+        help=(
+            "Enable mutual authentication: we send a named HELLO as our "
+            "own --key, and require the sender's KEY_EXCHANGE to be "
+            "signed by a key matching keys/<name>_public.pem for this "
+            "peer name. Requires the sender to also run with --peer. "
+            "Omit for the original unauthenticated handshake."
+        ),
+    )
+    parser.add_argument(
         "--version", "-v",
         action="version",
         version="secure-file-transfer receiver v1.0.0",
@@ -679,6 +764,7 @@ def main():
         key_name     = args.key,
         output_dir   = Path(args.output),
         bench_report = Path(args.bench_report) if args.bench_report else None,
+        peer_name    = args.peer,
     )
 
 

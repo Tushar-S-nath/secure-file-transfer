@@ -54,6 +54,9 @@ try:
         generate_session_key_gcm,
         bundle_keys_gcm,
         encrypt_file_stream_gcm,
+        verify_peer_identity,
+        sign_data,
+        compute_key_fingerprint,
     )
     from protocol import (
         send_packet,
@@ -64,6 +67,8 @@ try:
         build_file_chunk,
         build_transfer_end,
         build_error,
+        parse_hello_named,
+        build_key_exchange_signed,
     )
     from keygen import load_private_key, load_public_key
     from logger import TransferSession, log_info, log_error
@@ -72,6 +77,7 @@ try:
         HandshakeError,
         SessionError,
         IntegrityError,
+        AuthenticationError,
     )
 except ImportError as exc:
     print(f"[FATAL] Missing dependency: {exc}")
@@ -151,6 +157,9 @@ def perform_transfer(
     session: TransferSession,
     chunk_size: int = DEFAULT_CHUNK_SIZE,
     cipher_mode: str = "AES-256-GCM",
+    peer_name: str = None,
+    own_name: str = None,
+    own_private_key=None,
 ) -> dict:
     """
     Execute the full handshake + file transfer over an established socket.
@@ -168,6 +177,18 @@ def perform_transfer(
                      authentication, no separate HMAC pass. CBC is kept
                      available for comparison/benchmarking against the
                      original design (see paper Results section).
+        peer_name:   If given, enables MUTUAL AUTHENTICATION: the receiver
+                     must present a HELLO claiming this exact name, with a
+                     public key matching the locally trusted copy at
+                     keys/<peer_name>_public.pem — and this sender signs
+                     its key-exchange bundle with own_private_key so the
+                     receiver can verify OUR identity too. If None
+                     (default), falls back to the original unauthenticated
+                     handshake — unchanged behavior for existing callers.
+        own_name:        This sender's own identity name (required if
+                          peer_name is set — used in the signature).
+        own_private_key: This sender's own RSA private key object
+                          (required if peer_name is set — used to sign).
 
     Returns:
         A stats dict with wall-clock timings (handshake_seconds,
@@ -178,6 +199,8 @@ def perform_transfer(
     """
     if cipher_mode not in ("AES-256-GCM", "AES-256-CBC"):
         raise ValueError(f"Unknown cipher_mode: {cipher_mode!r}")
+    if peer_name is not None and (own_name is None or own_private_key is None):
+        raise ValueError("peer_name requires own_name and own_private_key (mutual auth needs both to sign).")
 
     filename = file_path.name
     file_size = file_path.stat().st_size
@@ -187,24 +210,45 @@ def perform_transfer(
     t_start = time.perf_counter()
 
     # ── Steps 1-3: HELLO → generate session keys → KEY_EXCHANGE ────────────
-    # perform_sender_handshake() owns the whole exchange: it receives HELLO,
-    # extracts the receiver's public key PEM, hands that PEM to our
-    # build_bundle() callback (which generates the session key(s) and
-    # RSA-encrypts them), and sends the resulting bundle as KEY_EXCHANGE.
-    # session_keys is populated as a side effect so we can use the key
-    # material afterward, since it's only generated *inside* the callback
-    # (after we've actually seen the receiver's public key).
-    log_info(f"Performing handshake with receiver… (cipher_mode={cipher_mode})")
+    log_info(f"Performing handshake with receiver… (cipher_mode={cipher_mode}"
+             f"{f', mutual auth as {own_name} expecting {peer_name}' if peer_name else ''})")
     session_keys = {}
 
-    def build_bundle(receiver_pubkey_pem: bytes) -> bytes:
-        from Crypto.PublicKey import RSA
-        receiver_pubkey = RSA.import_key(receiver_pubkey_pem)
+    if peer_name is not None:
+        # ── Mutual-auth handshake ───────────────────────────────────────
+        # We own this exchange directly (not perform_sender_handshake's
+        # callback pattern) since the wire format differs: named HELLO in,
+        # signed KEY_EXCHANGE out.
+        ptype, hello_payload = recv_packet(conn)
+        if ptype != PacketType.HELLO:
+            raise HandshakeError(f"Expected HELLO, got {ptype}")
+        try:
+            hello = parse_hello_named(hello_payload)
+        except Exception as exc:
+            raise HandshakeError(
+                f"Failed to parse named HELLO — is the receiver also using "
+                f"--peer? {exc}"
+            ) from exc
+
+        if hello["name"] != peer_name:
+            raise AuthenticationError(
+                f"Receiver claimed identity '{hello['name']}', expected '{peer_name}'.",
+                details="Refusing to proceed — this could be a wrong peer or an impersonation attempt."
+            )
+
+        # verify_peer_identity checks the PRESENTED key's fingerprint
+        # against our LOCALLY trusted keys/<peer_name>_public.pem, and
+        # returns that trusted copy (not the presented one) to encrypt
+        # with — belt and suspenders, though at this point they're
+        # guaranteed to match.
+        receiver_pubkey = verify_peer_identity(peer_name, hello["public_key"])
+        log_info(f"✓ Receiver identity verified: '{peer_name}' "
+                 f"(fingerprint {compute_key_fingerprint(receiver_pubkey)[:16]}…)")
 
         if cipher_mode == "AES-256-GCM":
             aes_key, base_nonce = generate_session_key_gcm()
-            session_keys["aes_key"]     = aes_key
-            session_keys["base_nonce"]  = base_nonce
+            session_keys["aes_key"]    = aes_key
+            session_keys["base_nonce"] = base_nonce
             bundle = bundle_keys_gcm(aes_key)
         else:
             aes_key, iv = generate_session_key()
@@ -214,12 +258,51 @@ def perform_transfer(
             session_keys["hmac_key"] = hmac_key
             bundle = bundle_keys(aes_key, hmac_key)
 
-        return rsa_encrypt(receiver_pubkey, bundle)
+        encrypted_bundle = rsa_encrypt(receiver_pubkey, bundle)
+        signature = sign_data(own_private_key, encrypted_bundle)
+        log_info(f"✓ Key-exchange bundle signed as '{own_name}'")
 
-    try:
-        perform_sender_handshake(conn, build_bundle)
-    except Exception as exc:
-        raise HandshakeError(f"Handshake failed: {exc}") from exc
+        try:
+            send_packet(
+                conn, PacketType.KEY_EXCHANGE,
+                build_key_exchange_signed(encrypted_bundle, own_name, signature)
+            )
+        except Exception as exc:
+            raise HandshakeError(f"Failed to send signed KEY_EXCHANGE: {exc}") from exc
+
+    else:
+        # ── Original, unauthenticated handshake (unchanged) ─────────────
+        # perform_sender_handshake() owns the whole exchange: it receives
+        # HELLO, extracts the receiver's public key PEM, hands that PEM to
+        # our build_bundle() callback (which generates the session key(s)
+        # and RSA-encrypts them), and sends the resulting bundle as
+        # KEY_EXCHANGE. session_keys is populated as a side effect so we
+        # can use the key material afterward, since it's only generated
+        # *inside* the callback (after we've actually seen the receiver's
+        # public key).
+        def build_bundle(receiver_pubkey_pem: bytes) -> bytes:
+            from Crypto.PublicKey import RSA
+            receiver_pubkey = RSA.import_key(receiver_pubkey_pem)
+
+            if cipher_mode == "AES-256-GCM":
+                aes_key, base_nonce = generate_session_key_gcm()
+                session_keys["aes_key"]     = aes_key
+                session_keys["base_nonce"]  = base_nonce
+                bundle = bundle_keys_gcm(aes_key)
+            else:
+                aes_key, iv = generate_session_key()
+                hmac_key    = generate_hmac_key()
+                session_keys["aes_key"]  = aes_key
+                session_keys["iv"]       = iv
+                session_keys["hmac_key"] = hmac_key
+                bundle = bundle_keys(aes_key, hmac_key)
+
+            return rsa_encrypt(receiver_pubkey, bundle)
+
+        try:
+            perform_sender_handshake(conn, build_bundle)
+        except Exception as exc:
+            raise HandshakeError(f"Handshake failed: {exc}") from exc
 
     aes_key = session_keys["aes_key"]
 
@@ -369,6 +452,9 @@ def run_server(
     chunk_size: int = DEFAULT_CHUNK_SIZE,
     bench_report: Optional[Path] = None,
     cipher_mode: str = "AES-256-GCM",
+    peer_name: str = None,
+    own_name: str = None,
+    own_private_key=None,
 ):
     """
     Start the TCP server, accept one receiver, run the full transfer, shut down.
@@ -381,6 +467,8 @@ def run_server(
                         failure. Used by the benchmark suite; no effect on
                         normal transfers when omitted.
         cipher_mode:   "AES-256-GCM" (default) or "AES-256-CBC".
+        peer_name, own_name, own_private_key: mutual authentication —
+            see perform_transfer's docstring.
     """
     if not file_path.exists():
         log_error(f"File not found: {file_path}")
@@ -426,7 +514,10 @@ def run_server(
         try:
             with conn:
                 conn.settimeout(ACK_TIMEOUT)
-                stats = perform_transfer(conn, file_path, session, chunk_size=chunk_size, cipher_mode=cipher_mode)
+                stats = perform_transfer(
+                    conn, file_path, session, chunk_size=chunk_size, cipher_mode=cipher_mode,
+                    peer_name=peer_name, own_name=own_name, own_private_key=own_private_key,
+                )
                 print(f"\n  ✓ Transfer complete.")
 
         except HandshakeError as exc:
@@ -550,6 +641,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--peer",
+        type=str,
+        default=None,
+        metavar="NAME",
+        help=(
+            "Enable mutual authentication: the receiver must present this "
+            "exact identity name with a public key matching "
+            "keys/<name>_public.pem, and we sign the key exchange with our "
+            "own --key so the receiver can verify us too. Requires the "
+            "receiver to also run with --peer. Omit for the original "
+            "unauthenticated handshake."
+        ),
+    )
+    parser.add_argument(
         "--bench-report",
         type=str,
         default=None,
@@ -583,10 +688,13 @@ def main():
         )
 
     try:
-        load_private_key(args.key)
+        own_private_key = load_private_key(args.key)
         log_info(f"Sender private key loaded: '{args.key}'")
     except Exception as exc:
         parser.error(f"Failed to load private key '{args.key}': {exc}")
+
+    if args.peer:
+        log_info(f"Mutual authentication enabled — expecting receiver '{args.peer}', signing as '{args.key}'")
 
     run_server(
         Path(args.file).resolve(),
@@ -595,6 +703,9 @@ def main():
         chunk_size=args.chunk_size,
         bench_report=Path(args.bench_report) if args.bench_report else None,
         cipher_mode="AES-256-GCM" if args.cipher_mode == "gcm" else "AES-256-CBC",
+        peer_name=args.peer,
+        own_name=args.key if args.peer else None,
+        own_private_key=own_private_key if args.peer else None,
     )
 
 

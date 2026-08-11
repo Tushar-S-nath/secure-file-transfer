@@ -200,6 +200,101 @@ def parse_key_exchange(payload: bytes) -> bytes:
     return payload
 
 
+# ── Mutual authentication variants ──────────────────────────────────────
+# NEW, separate payload formats — build_hello/parse_hello and
+# build_key_exchange/parse_key_exchange above are left completely
+# unchanged (still used when a transfer doesn't opt into mutual auth via
+# --peer). These carry an identity name and, for KEY_EXCHANGE, a
+# signature proving the sender's identity. See crypto_utils.py's
+# "Identity: Fingerprinting and RSA Signatures" section for the
+# verification side.
+
+def build_hello_named(public_key_pem: bytes, name: str) -> bytes:
+    """
+    Named HELLO payload for mutual authentication. Carries the sender's
+    public key AND their claimed identity name, so the receiving side
+    can verify the presented key against a locally trusted copy for
+    that name (crypto_utils.verify_peer_identity) instead of trusting
+    whatever key shows up on the wire.
+    """
+    payload = {"name": name, "public_key": public_key_pem.decode("utf-8")}
+    return json.dumps(payload).encode("utf-8")
+
+
+def parse_hello_named(payload: bytes) -> dict:
+    """
+    Parse a named HELLO payload (see build_hello_named).
+
+    Returns:
+        {"name": str, "public_key": bytes}
+    """
+    try:
+        obj = json.loads(payload.decode("utf-8"))
+        name = obj["name"]
+        public_key_pem = obj["public_key"].encode("utf-8")
+        if not public_key_pem.startswith(b"-----BEGIN"):
+            raise ValueError("public_key field is not a valid PEM key")
+        return {"name": name, "public_key": public_key_pem}
+    except (json.JSONDecodeError, KeyError, ValueError, UnicodeDecodeError) as e:
+        raise HandshakeError("Invalid named HELLO payload.", details=str(e))
+
+
+def build_key_exchange_signed(encrypted_bundle: bytes, sender_name: str, signature: bytes) -> bytes:
+    """
+    KEY_EXCHANGE payload carrying a signature that proves the sender's
+    identity, for mutual authentication. The sender signs
+    `encrypted_bundle` with its OWN private key
+    (crypto_utils.sign_data); the receiver verifies that signature
+    against the LOCALLY trusted public key for `sender_name` — the
+    sender's public key itself is never transmitted here, deliberately,
+    so the receiver can only ever trust a key it already had on file.
+
+    Wire format (binary, not JSON — encrypted_bundle and signature are
+    both raw high-entropy bytes, which don't round-trip cleanly through
+    JSON without base64 overhead):
+        [4-byte name length][name utf-8]
+        [4-byte signature length][signature]
+        [encrypted_bundle — remainder of payload]
+    """
+    name_bytes = sender_name.encode("utf-8")
+    out  = struct.pack(">I", len(name_bytes)) + name_bytes
+    out += struct.pack(">I", len(signature)) + signature
+    out += encrypted_bundle
+    return out
+
+
+def parse_key_exchange_signed(payload: bytes) -> dict:
+    """
+    Parse a signed KEY_EXCHANGE payload (see build_key_exchange_signed).
+
+    Returns:
+        {"sender_name": str, "signature": bytes, "encrypted_bundle": bytes}
+    """
+    try:
+        offset = 0
+        name_len = struct.unpack(">I", payload[offset:offset + 4])[0]
+        offset += 4
+        sender_name = payload[offset:offset + name_len].decode("utf-8")
+        offset += name_len
+
+        sig_len = struct.unpack(">I", payload[offset:offset + 4])[0]
+        offset += 4
+        signature = payload[offset:offset + sig_len]
+        offset += sig_len
+
+        encrypted_bundle = payload[offset:]
+        if not sender_name or not signature or not encrypted_bundle:
+            raise ValueError("One or more fields empty in signed KEY_EXCHANGE payload")
+
+        return {
+            "sender_name": sender_name,
+            "signature": signature,
+            "encrypted_bundle": encrypted_bundle,
+        }
+    except (struct.error, UnicodeDecodeError, IndexError, ValueError) as e:
+        raise HandshakeError("Invalid signed KEY_EXCHANGE payload.", details=str(e))
+
+
 def build_file_header(
     filename: str,
     file_size: int,

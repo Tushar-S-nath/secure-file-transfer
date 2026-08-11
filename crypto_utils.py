@@ -20,8 +20,9 @@ from Crypto.Cipher     import AES, PKCS1_OAEP
 from Crypto.Hash       import SHA256
 from Crypto.Random     import get_random_bytes
 from Crypto.Util.Padding import pad, unpad
+from Crypto.Signature  import pss
 
-from exceptions import EncryptionError, DecryptionError, IntegrityError
+from exceptions import EncryptionError, DecryptionError, IntegrityError, AuthenticationError
 
 
 # ── Constants ──────────────────────────────────────────────────────────────────
@@ -113,6 +114,121 @@ def rsa_decrypt(private_key: RSA.RsaKey, ciphertext: bytes) -> bytes:
         return cipher.decrypt(ciphertext)
     except (ValueError, TypeError) as e:
         raise DecryptionError("RSA-OAEP decryption failed. Wrong key or corrupted data.", details=str(e))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECTION 1B — Identity: Fingerprinting and RSA Signatures (Mutual Auth)
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Prior to this, neither side of a transfer proved WHO they were — the
+# receiver's public key (sent in HELLO) was trusted unconditionally, and
+# the sender proved no identity at all (see paper Known Limitations,
+# "No Sender Authentication"). This section adds the primitives for real
+# mutual authentication: each side signs something with their own
+# private key, and the other side verifies that signature against a
+# public key it already trusts locally for that claimed name — the same
+# trust model SSH uses with known_hosts/authorized_keys. How a public
+# key file was legitimately obtained in the first place (out-of-band,
+# before any transfer) is an assumption of this model, not something
+# the protocol itself can bootstrap — same as SSH.
+
+def compute_key_fingerprint(public_key_pem: bytes) -> str:
+    """
+    SHA-256 fingerprint of a public key, as a hex string. Used to let a
+    human visually confirm two copies of "the same" public key actually
+    match (e.g. reading it aloud over a phone call before first use —
+    the standard SSH host-key-verification pattern), and internally to
+    compare a presented key against a locally trusted one.
+    """
+    key = RSA.import_key(public_key_pem) if not isinstance(public_key_pem, RSA.RsaKey) else public_key_pem
+    der = key.public_key().export_key(format="DER")
+    return hashlib.sha256(der).hexdigest()
+
+
+def sign_data(private_key: RSA.RsaKey, data: bytes) -> bytes:
+    """
+    Sign `data` with an RSA private key using RSA-PSS (the modern,
+    recommended RSA signature scheme — probabilistic, like OAEP is for
+    encryption, so signing the same data twice produces different
+    signature bytes each time).
+
+    Returns:
+        Signature bytes (256 bytes for a 2048-bit key)
+    """
+    try:
+        h = SHA256.new(data)
+        return pss.new(private_key).sign(h)
+    except (ValueError, TypeError) as e:
+        raise EncryptionError("RSA-PSS signing failed.", details=str(e))
+
+
+def verify_signature(public_key: RSA.RsaKey, data: bytes, signature: bytes) -> None:
+    """
+    Verify an RSA-PSS signature. Raises AuthenticationError if the
+    signature does not match — does not return False, to make it
+    impossible to accidentally ignore a failed verification the way a
+    boolean return value could be.
+    """
+    try:
+        h = SHA256.new(data)
+        pss.new(public_key).verify(h, signature)
+    except (ValueError, TypeError) as e:
+        raise AuthenticationError(
+            "Signature verification failed — identity could not be confirmed.",
+            details=str(e)
+        )
+
+
+def verify_peer_identity(claimed_name: str, presented_public_key_pem: bytes,
+                          trusted_keys_dir: str = "keys") -> RSA.RsaKey:
+    """
+    Check a presented public key against the locally trusted copy for
+    `claimed_name` (keys/<claimed_name>_public.pem). This is the "is
+    this really who they say they are" check — it does NOT verify a
+    signature by itself, just that the key being used matches what we
+    already trust for that name.
+
+    Returns:
+        The trusted RSA public key object (import it once here so
+        callers use the LOCAL trusted copy, not the presented one, for
+        any subsequent signature verification).
+
+    Raises:
+        AuthenticationError if no trusted key is on file for that name,
+        or if the presented key's fingerprint doesn't match it.
+    """
+    trusted_path = os.path.join(trusted_keys_dir, f"{claimed_name}_public.pem")
+    if not os.path.exists(trusted_path):
+        raise AuthenticationError(
+            f"No trusted public key on file for '{claimed_name}'.",
+            details=(
+                f"Expected at: {trusted_path}. A peer's public key must be "
+                f"obtained and placed there through a trusted channel BEFORE "
+                f"a transfer, not accepted from the transfer itself."
+            )
+        )
+
+    with open(trusted_path, "rb") as f:
+        trusted_key = RSA.import_key(f.read())
+
+    trusted_fingerprint   = compute_key_fingerprint(trusted_key)
+    presented_fingerprint = compute_key_fingerprint(presented_public_key_pem)
+
+    if trusted_fingerprint != presented_fingerprint:
+        raise AuthenticationError(
+            f"Public key presented for '{claimed_name}' does not match "
+            f"the locally trusted key.",
+            details=(
+                f"Expected fingerprint {trusted_fingerprint[:16]}…, got "
+                f"{presented_fingerprint[:16]}… — this could mean a "
+                f"man-in-the-middle attack, or that {claimed_name}'s real "
+                f"key was legitimately rotated (in which case the trusted "
+                f"copy in {trusted_keys_dir}/ needs updating deliberately, "
+                f"not automatically)."
+            )
+        )
+
+    return trusted_key
 
 
 def bundle_keys(aes_key: bytes, hmac_key: bytes) -> bytes:

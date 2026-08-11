@@ -49,3 +49,13 @@ class PacketError(SecureTransferError):
 class SessionError(SecureTransferError):
     """Raised when a transfer session encounters an unexpected error."""
     pass
+
+
+class AuthenticationError(SecureTransferError):
+    """Raised when mutual authentication fails — a peer's identity could
+    not be verified against the locally trusted public key for the name
+    they claim to be. This is distinct from HandshakeError: a handshake
+    can complete mechanically (packets exchanged fine) while still
+    failing authentication (the identity behind those packets is wrong
+    or unverifiable)."""
+    pass
