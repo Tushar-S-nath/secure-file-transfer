@@ -209,15 +209,23 @@ def parse_key_exchange(payload: bytes) -> bytes:
 # "Identity: Fingerprinting and RSA Signatures" section for the
 # verification side.
 
-def build_hello_named(public_key_pem: bytes, name: str) -> bytes:
+def build_hello_named(public_key_pem: bytes, name: str, challenge_nonce: bytes) -> bytes:
     """
-    Named HELLO payload for mutual authentication. Carries the sender's
-    public key AND their claimed identity name, so the receiving side
-    can verify the presented key against a locally trusted copy for
-    that name (crypto_utils.verify_peer_identity) instead of trusting
-    whatever key shows up on the wire.
+    Named HELLO payload for mutual authentication + replay protection.
+    Carries the sender's public key, their claimed identity name (so
+    the receiving side can verify the presented key against a locally
+    trusted copy — crypto_utils.verify_peer_identity), AND a fresh
+    challenge_nonce generated for THIS connection attempt only.
+
+    The other side must bind challenge_nonce into its signed
+    key-exchange bundle (see crypto_utils.generate_challenge_nonce for
+    why this prevents replaying a captured old session).
     """
-    payload = {"name": name, "public_key": public_key_pem.decode("utf-8")}
+    payload = {
+        "name": name,
+        "public_key": public_key_pem.decode("utf-8"),
+        "challenge_nonce": challenge_nonce.hex(),
+    }
     return json.dumps(payload).encode("utf-8")
 
 
@@ -226,15 +234,18 @@ def parse_hello_named(payload: bytes) -> dict:
     Parse a named HELLO payload (see build_hello_named).
 
     Returns:
-        {"name": str, "public_key": bytes}
+        {"name": str, "public_key": bytes, "challenge_nonce": bytes}
     """
     try:
         obj = json.loads(payload.decode("utf-8"))
         name = obj["name"]
         public_key_pem = obj["public_key"].encode("utf-8")
+        challenge_nonce = bytes.fromhex(obj["challenge_nonce"])
         if not public_key_pem.startswith(b"-----BEGIN"):
             raise ValueError("public_key field is not a valid PEM key")
-        return {"name": name, "public_key": public_key_pem}
+        if len(challenge_nonce) < 16:
+            raise ValueError("challenge_nonce too short — expected 16 bytes")
+        return {"name": name, "public_key": public_key_pem, "challenge_nonce": challenge_nonce}
     except (json.JSONDecodeError, KeyError, ValueError, UnicodeDecodeError) as e:
         raise HandshakeError("Invalid named HELLO payload.", details=str(e))
 

@@ -132,6 +132,33 @@ def rsa_decrypt(private_key: RSA.RsaKey, ciphertext: bytes) -> bytes:
 # before any transfer) is an assumption of this model, not something
 # the protocol itself can bootstrap — same as SSH.
 
+CHALLENGE_NONCE_SIZE = 16   # 128 bits — generated fresh per session for replay protection
+
+
+def generate_challenge_nonce() -> bytes:
+    """
+    Generate a fresh random challenge nonce for replay protection.
+
+    The receiver generates one of these for every single connection
+    attempt and sends it in HELLO. The sender must bind this exact
+    nonce into its signed key-exchange bundle (see sender.py/receiver.py
+    perform_transfer). Because a new, independent random nonce is
+    generated per connection, a captured full session — HELLO through
+    TRANSFER_END, including a genuinely valid signature — cannot be
+    replayed against a later connection attempt: the replayed
+    signature was computed over the OLD nonce, which will not match the
+    NEW nonce this receiver just generated for THIS attempt, so
+    verification fails.
+
+    128 bits of randomness makes an accidental repeat across sessions
+    astronomically unlikely (this is not a persisted/tracked cache —
+    freshness comes from the nonce being both random AND scoped to a
+    single connection attempt, not from checking it against a history
+    of past nonces).
+    """
+    return get_random_bytes(CHALLENGE_NONCE_SIZE)
+
+
 def compute_key_fingerprint(public_key_pem: bytes) -> str:
     """
     SHA-256 fingerprint of a public key, as a hex string. Used to let a

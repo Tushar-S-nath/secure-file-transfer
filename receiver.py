@@ -52,6 +52,7 @@ try:
         decrypt_file_stream_gcm,
         verify_peer_identity,
         verify_signature,
+        generate_challenge_nonce,
     )
     from protocol import (
         send_packet,
@@ -293,10 +294,18 @@ def perform_transfer(
 
     # ── Step 1: Handshake ───────────────────────────────────────────────────
     if peer_name is not None:
-        # ── Mutual-auth handshake ───────────────────────────────────────
+        # ── Mutual-auth handshake + replay protection ───────────────────
+        # challenge_nonce is fresh random bytes generated for THIS
+        # connection attempt only (crypto_utils.generate_challenge_nonce).
+        # The sender must sign encrypted_bundle + challenge_nonce, not
+        # just encrypted_bundle — this is what makes a captured old
+        # session unreplayable against a new connection: the replayed
+        # signature was computed over a DIFFERENT (old) nonce, so it
+        # won't match what we verify against here.
+        challenge_nonce = generate_challenge_nonce()
         log_info(f"Sending named HELLO as '{own_name}' (mutual auth, expecting sender '{peer_name}')…")
         try:
-            send_packet(conn, PacketType.HELLO, build_hello_named(public_key_pem, own_name))
+            send_packet(conn, PacketType.HELLO, build_hello_named(public_key_pem, own_name, challenge_nonce))
             ptype, kx_payload = recv_packet(conn)
         except Exception as exc:
             raise HandshakeError(f"Handshake failed: {exc}") from exc
@@ -333,8 +342,20 @@ def perform_transfer(
         from Crypto.PublicKey import RSA as _RSA
         sender_trusted_pubkey = _RSA.import_key(sender_trusted_pubkey_pem)
 
-        verify_signature(sender_trusted_pubkey, kx["encrypted_bundle"], kx["signature"])
-        log_info(f"✓ Sender identity verified: '{peer_name}'")
+        # Verifying over (encrypted_bundle + challenge_nonce), NOT just
+        # encrypted_bundle, is the actual replay-protection check: a
+        # signature captured from a past session was computed over that
+        # past session's (different) nonce and will fail here.
+        try:
+            verify_signature(sender_trusted_pubkey, kx["encrypted_bundle"] + challenge_nonce, kx["signature"])
+        except AuthenticationError as exc:
+            raise AuthenticationError(
+                "Signature verification failed — this may be a replayed "
+                "old session (bound to a stale challenge) as well as a "
+                "possible impersonation attempt.",
+                details=str(exc)
+            ) from exc
+        log_info(f"✓ Sender identity verified: '{peer_name}' (fresh session, not a replay)")
 
         encrypted_bundle = kx["encrypted_bundle"]
 

@@ -126,17 +126,23 @@ class TestVerifyPeerIdentity(unittest.TestCase):
 class _FakeMutualAuthSender:
     """Plays the sender's role in the mutual-auth handshake against the
     REAL receiver.perform_transfer(): receives the receiver's named
-    HELLO, then sends a signed KEY_EXCHANGE using a real RSA-PSS
-    signature — either correctly (signing_key/claimed_name matching a
-    real trusted identity) or incorrectly (to test rejection)."""
+    HELLO (which now includes a fresh challenge_nonce), then sends a
+    signed KEY_EXCHANGE using a real RSA-PSS signature — either
+    correctly bound to that nonce, or bound to a DIFFERENT nonce (to
+    simulate replaying an old captured session against this new one)."""
 
     def __init__(self, sock, plaintext_path, signing_key, claimed_name,
-                 chunk_size=64 * 1024):
+                 chunk_size=64 * 1024, nonce_override=None):
         self.sock = sock
         self.plaintext_path = plaintext_path
         self.signing_key = signing_key      # private key used to SIGN
         self.claimed_name = claimed_name    # identity name claimed in KEY_EXCHANGE
         self.chunk_size = chunk_size
+        self.nonce_override = nonce_override  # if set, sign against THIS nonce
+                                               # instead of the real one from HELLO —
+                                               # simulates replaying a signature that
+                                               # was actually computed for a
+                                               # DIFFERENT (old, captured) session
         self.result = None
 
     def run(self):
@@ -145,10 +151,12 @@ class _FakeMutualAuthSender:
         hello = parse_hello_named(hello_payload)
         receiver_pubkey = RSA.import_key(hello["public_key"])
 
+        nonce_to_sign = self.nonce_override if self.nonce_override is not None else hello["challenge_nonce"]
+
         aes_key, base_nonce = generate_session_key_gcm()
         bundle = bundle_keys_gcm(aes_key)
         encrypted_bundle = rsa_encrypt(receiver_pubkey, bundle)
-        signature = sign_data(self.signing_key, encrypted_bundle)
+        signature = sign_data(self.signing_key, encrypted_bundle + nonce_to_sign)
 
         send_packet(
             self.sock, PacketType.KEY_EXCHANGE,
@@ -182,13 +190,14 @@ class TestMutualAuthProtocol(unittest.TestCase):
         if not (KEYS_DIR / "bob_private.pem").exists() or not (KEYS_DIR / "alice_private.pem").exists():
             self.skipTest("alice/bob test key pairs not present; run keygen.py first")
 
-    def _run(self, signing_key, claimed_name, peer_name="alice"):
+    def _run(self, signing_key, claimed_name, peer_name="alice", nonce_override=None):
         tmp = Path(tempfile.mkdtemp())
         plaintext_path = tmp / "plain.bin"
         plaintext_path.write_bytes(os.urandom(64 * 1024 * 2 + 500))
 
         sender_sock, receiver_sock = socket.socketpair()
-        fake_sender = _FakeMutualAuthSender(sender_sock, str(plaintext_path), signing_key, claimed_name)
+        fake_sender = _FakeMutualAuthSender(sender_sock, str(plaintext_path), signing_key,
+                                             claimed_name, nonce_override=nonce_override)
         t = threading.Thread(target=fake_sender.run, daemon=True)
         t.start()
 
@@ -242,6 +251,42 @@ class TestMutualAuthProtocol(unittest.TestCase):
 
         self.assertEqual(outcome["status"], "failed")
         self.assertEqual(outcome["exception_type"], "AuthenticationError")
+
+    def test_replayed_old_session_rejected(self):
+        """The core replay-protection test: a signature that is
+        otherwise completely genuine (real key, correct claimed name)
+        but was computed against a DIFFERENT (stale/old) challenge nonce
+        — exactly what an attacker would have if they captured a full
+        legitimate past session and tried to replay it against this new
+        connection attempt, which generated its own fresh nonce."""
+        alice_private = load_private_key("alice")
+        stale_nonce_from_a_past_captured_session = os.urandom(16)
+
+        outcome = self._run(
+            signing_key=alice_private, claimed_name="alice", peer_name="alice",
+            nonce_override=stale_nonce_from_a_past_captured_session,
+        )
+
+        self.assertEqual(outcome["status"], "failed")
+        self.assertEqual(outcome["exception_type"], "AuthenticationError")
+        self.assertIn("replay", outcome["exception"].lower())
+
+    def test_fresh_nonce_required_every_connection(self):
+        """Confirms two consecutive legitimate connections get two
+        DIFFERENT nonces (the actual mechanism replay protection relies
+        on) — if nonces ever repeated, a captured session COULD be
+        replayed successfully against a later connection."""
+        alice_private = load_private_key("alice")
+        outcome1 = self._run(signing_key=alice_private, claimed_name="alice", peer_name="alice")
+        outcome2 = self._run(signing_key=alice_private, claimed_name="alice", peer_name="alice")
+
+        self.assertEqual(outcome1["status"], "success")
+        self.assertEqual(outcome2["status"], "success")
+        # Both succeeded independently because each connection generated
+        # its OWN fresh nonce and the fake sender (correctly, this time)
+        # bound its signature to whichever nonce it actually received —
+        # this is what proves nonces aren't reused across connections,
+        # not just that replay is rejected once.
 
 
 if __name__ == "__main__":

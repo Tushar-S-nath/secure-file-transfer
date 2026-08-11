@@ -259,8 +259,13 @@ def perform_transfer(
             bundle = bundle_keys(aes_key, hmac_key)
 
         encrypted_bundle = rsa_encrypt(receiver_pubkey, bundle)
-        signature = sign_data(own_private_key, encrypted_bundle)
-        log_info(f"✓ Key-exchange bundle signed as '{own_name}'")
+        # Sign (encrypted_bundle + challenge_nonce), NOT just
+        # encrypted_bundle — this is the sender's half of replay
+        # protection. The nonce came from THIS receiver's THIS HELLO, so
+        # our signature can never be validly replayed against a future
+        # connection (which will present a different, fresh nonce).
+        signature = sign_data(own_private_key, encrypted_bundle + hello["challenge_nonce"])
+        log_info(f"✓ Key-exchange bundle signed as '{own_name}' (bound to this session's challenge)")
 
         try:
             send_packet(
