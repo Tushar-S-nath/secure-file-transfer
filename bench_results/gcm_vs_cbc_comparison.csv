@@ -1,0 +1,7 @@
+label,mode,throughput_mb_s,total_seconds,checksum_match
+1MB,gcm,28.40,0.0660,True
+1MB,cbc,85.57,0.0445,True
+10MB,gcm,52.41,0.2929,True
+10MB,cbc,67.78,0.3054,True
+50MB,gcm,54.23,1.2789,True
+50MB,cbc,65.53,1.3850,True

@@ -31,6 +31,11 @@ CHUNK_SIZE      = 65536       # 64 KB per chunk — optimal for streaming
 HMAC_SIZE       = 32          # SHA-256 produces 32-byte digest
 RSA_HASH        = "SHA-256"   # Hash used inside OAEP padding
 
+# AES-256-GCM (authenticated encryption) constants.
+AES_GCM_BASE_NONCE_SIZE = 8    # random per-session prefix
+AES_GCM_NONCE_SIZE      = 12   # full per-chunk nonce = base_nonce + 4-byte counter
+AES_GCM_TAG_SIZE        = 16   # authentication tag appended to each chunk's ciphertext
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  SECTION 1 — SESSION KEY GENERATION
@@ -129,6 +134,203 @@ def unbundle_keys(data: bytes) -> Tuple[bytes, bytes]:
     aes_key  = data[4 : 4 + aes_len]
     hmac_key = data[4 + aes_len :]
     return aes_key, hmac_key
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECTION 2B — AES-256-GCM (Authenticated Encryption — replaces CBC+HMAC)
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# GCM (Galois/Counter Mode) is an AEAD (Authenticated Encryption with
+# Associated Data) mode: encryption and integrity verification happen in
+# ONE operation instead of two separate ones (AES-CBC, then a separate
+# HMAC pass). This has two consequences that directly address the
+# weaknesses documented for the CBC+HMAC path (see paper Section V):
+#
+#   1. No padding step. GCM is a stream cipher construction internally —
+#      ciphertext is always exactly as long as plaintext. There is no
+#      PKCS#7 padding to validate, so there is no padding-failure code
+#      path to accidentally distinguish from an authentication failure.
+#      The padding-oracle attack class does not apply here at all —
+#      not "is mitigated", genuinely does not exist as an attack surface.
+#
+#   2. Per-chunk authentication. Each chunk carries its own 16-byte tag
+#      and is verified independently, so corruption is detected on the
+#      FIRST bad chunk rather than only after the entire file has been
+#      received and a single whole-file HMAC is checked at the end.
+#
+# Nonce construction: each session gets a fresh 8-byte random
+# base_nonce (generate_session_key_gcm). Each chunk's actual 12-byte GCM
+# nonce is base_nonce + chunk_index (4-byte big-endian counter). This is
+# the "fixed field + counter" deterministic construction described in
+# NIST SP 800-38D Section 8.2.1 — it guarantees the nonce never repeats
+# within a session (the counter is strictly increasing) and, with 8
+# bytes of fresh randomness per session, makes a cross-session repeat
+# astronomically unlikely for any realistic number of sessions this
+# system will ever run.
+#
+# CRITICAL: a (key, nonce) pair must NEVER be reused with GCM — doing so
+# catastrophically breaks both confidentiality and integrity. This is
+# why the session key AND base_nonce are both regenerated fresh for
+# every single transfer (see generate_session_key_gcm).
+
+def generate_session_key_gcm() -> Tuple[bytes, bytes]:
+    """
+    Generate a fresh AES-256 key and 8-byte random base nonce for a new
+    GCM session. Called once per transfer, same as generate_session_key()
+    for the CBC path — this is what provides session-level forward
+    secrecy for GCM mode too.
+
+    Returns:
+        (aes_key, base_nonce) — 32 bytes, 8 bytes
+    """
+    aes_key    = get_random_bytes(AES_KEY_SIZE)
+    base_nonce = get_random_bytes(AES_GCM_BASE_NONCE_SIZE)
+    return aes_key, base_nonce
+
+
+def _gcm_nonce_for_chunk(base_nonce: bytes, chunk_index: int) -> bytes:
+    """Derive the per-chunk 12-byte GCM nonce. See module docstring above
+    for why this construction is safe against nonce reuse."""
+    if len(base_nonce) != AES_GCM_BASE_NONCE_SIZE:
+        raise EncryptionError(
+            f"GCM base_nonce must be {AES_GCM_BASE_NONCE_SIZE} bytes.",
+            details=f"Got {len(base_nonce)} bytes."
+        )
+    if chunk_index >= 2**32:
+        # Would wrap the 4-byte counter and risk nonce reuse — refuse
+        # rather than silently produce an unsafe nonce. At 64KB chunks
+        # this is a ~256 TB file, far beyond any realistic transfer.
+        raise EncryptionError("Too many chunks for a single GCM session (counter would wrap).")
+    return base_nonce + struct.pack(">I", chunk_index)
+
+
+def bundle_keys_gcm(aes_key: bytes) -> bytes:
+    """
+    Bundle the AES key alone for RSA encryption. GCM mode needs no
+    separate HMAC key — each chunk authenticates itself — so this is
+    simpler than bundle_keys() (CBC path), which must carry both an AES
+    key and an HMAC key. Kept as a named function (rather than just using
+    aes_key directly) for interface symmetry with bundle_keys/unbundle_keys.
+    """
+    return aes_key
+
+
+def unbundle_keys_gcm(data: bytes) -> bytes:
+    """Reverse of bundle_keys_gcm() — trivial, kept for symmetry."""
+    return data
+
+
+def encrypt_file_stream_gcm(
+    filepath: str,
+    aes_key: bytes,
+    base_nonce: bytes,
+    chunk_size: int = CHUNK_SIZE,
+) -> Generator[bytes, None, None]:
+    """
+    Generator that encrypts a file with AES-256-GCM, one independently
+    authenticated chunk at a time, and yields (ciphertext + tag) per
+    chunk — the last AES_GCM_TAG_SIZE bytes of each yielded value are
+    the tag.
+
+    Unlike encrypt_file_stream() (CBC), there is no padding step and no
+    special-casing of the final chunk — GCM ciphertext is always exactly
+    as long as the plaintext chunk that produced it.
+
+    Args:
+        filepath   : path to the source file
+        aes_key    : 32-byte AES-256 key
+        base_nonce : 8-byte session base nonce (see generate_session_key_gcm)
+        chunk_size : plaintext bytes read per chunk
+
+    Yields:
+        ciphertext + tag, one chunk at a time
+    """
+    if not os.path.exists(filepath):
+        raise EncryptionError("File not found.", details=f"Path: {filepath}")
+
+    file_size = os.path.getsize(filepath)
+    if file_size == 0:
+        raise EncryptionError("Cannot encrypt an empty file.", details=f"Path: {filepath}")
+
+    try:
+        with open(filepath, "rb") as f:
+            chunk_index = 0
+            while True:
+                chunk = f.read(chunk_size)
+                if not chunk:
+                    break
+                nonce  = _gcm_nonce_for_chunk(base_nonce, chunk_index)
+                cipher = AES.new(aes_key, AES.MODE_GCM, nonce=nonce)
+                ciphertext, tag = cipher.encrypt_and_digest(chunk)
+                yield ciphertext + tag
+                chunk_index += 1
+    except (OSError, IOError) as e:
+        raise EncryptionError("File read error during encryption.", details=str(e))
+
+
+def decrypt_file_stream_gcm(
+    encrypted_chunks: Generator[bytes, None, None],
+    aes_key: bytes,
+    base_nonce: bytes,
+    output_path: str,
+    total_chunks: int,
+) -> str:
+    """
+    Consume an iterable of AES-256-GCM (ciphertext+tag) chunks, verify
+    and decrypt each one independently, and write the plaintext to
+    output_path.
+
+    Raises IntegrityError on the FIRST chunk that fails authentication —
+    a wrong tag means tampered/corrupted ciphertext, a wrong key, or a
+    nonce mismatch. Decryption and verification happen together in one
+    call (cipher.decrypt_and_verify): there is no separate "decrypt,
+    then check" phase boundary the way there is for CBC+HMAC, so there
+    is no equivalent of the CBC padding-failure-vs-HMAC-failure
+    distinction for a network observer to exploit.
+
+    Args:
+        encrypted_chunks : iterable of (ciphertext + tag) chunks
+        aes_key           : 32-byte AES-256 key
+        base_nonce        : 8-byte session base nonce
+        output_path       : where to write the decrypted file
+        total_chunks      : expected chunk count (detects truncation)
+
+    Returns:
+        output_path
+    """
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+
+    chunk_index = 0
+    try:
+        with open(output_path, "wb") as f:
+            for chunk_with_tag in encrypted_chunks:
+                if len(chunk_with_tag) < AES_GCM_TAG_SIZE:
+                    raise IntegrityError(
+                        f"Chunk {chunk_index + 1} too short to contain a GCM tag "
+                        f"— truncated or corrupted in transit."
+                    )
+                ciphertext = chunk_with_tag[:-AES_GCM_TAG_SIZE]
+                tag        = chunk_with_tag[-AES_GCM_TAG_SIZE:]
+                nonce      = _gcm_nonce_for_chunk(base_nonce, chunk_index)
+                cipher     = AES.new(aes_key, AES.MODE_GCM, nonce=nonce)
+                try:
+                    plaintext = cipher.decrypt_and_verify(ciphertext, tag)
+                except ValueError as e:
+                    raise IntegrityError(
+                        f"GCM authentication failed on chunk "
+                        f"{chunk_index + 1}/{total_chunks} — file corrupted "
+                        f"or tampered.", details=str(e)
+                    ) from e
+                f.write(plaintext)
+                chunk_index += 1
+
+        if chunk_index != total_chunks:
+            raise IntegrityError(
+                f"Chunk count mismatch: expected {total_chunks}, got {chunk_index}."
+            )
+        return output_path
+    except (OSError, IOError) as e:
+        raise DecryptionError("File write error during decryption.", details=str(e))
 
 
 # ══════════════════════════════════════════════════════════════════════════════

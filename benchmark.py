@@ -97,9 +97,13 @@ def make_test_file(path: Path, size_bytes: int) -> None:
 
 
 def run_one_transfer(file_path: Path, chunk_size: int, run_dir: Path,
-                      timeout: float = 120.0) -> dict:
+                      timeout: float = 120.0, cipher_mode: str = "gcm") -> dict:
     """Run one real sender<->receiver transfer over loopback TCP and return
-    the combined stats dict (sender + receiver bench-report JSON)."""
+    the combined stats dict (sender + receiver bench-report JSON).
+
+    cipher_mode: "gcm" (default) or "cbc" — passed straight through to
+    sender.py's --cipher-mode flag. The receiver auto-detects the mode
+    from the header, so it needs no matching flag."""
     run_dir.mkdir(parents=True, exist_ok=True)
     port             = free_port()
     sender_report    = run_dir / "sender_report.json"
@@ -126,6 +130,7 @@ def run_one_transfer(file_path: Path, chunk_size: int, run_dir: Path,
         "--port", str(port),
         "--key", "alice",
         "--chunk-size", str(chunk_size),
+        "--cipher-mode", cipher_mode,
         "--bench-report", str(sender_report),
     ]
     with open(sender_log_path, "w") as sender_log:

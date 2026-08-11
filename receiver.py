@@ -48,6 +48,8 @@ try:
         decrypt_file_stream,
         verify_hmac,
         compute_sha256,
+        unbundle_keys_gcm,
+        decrypt_file_stream_gcm,
     )
     from protocol import (
         send_packet,
@@ -278,10 +280,13 @@ def perform_transfer(
     except Exception as exc:
         raise HandshakeError(f"Handshake failed: {exc}") from exc
 
-    # Decrypt the bundle with our private key to recover AES key + HMAC key
+    # Decrypt the RSA bundle, but do NOT unbundle it yet — whether it's a
+    # GCM bundle (just an AES key) or a CBC bundle (AES key + HMAC key,
+    # length-prefixed) depends on cipher_mode, which we don't learn until
+    # FILE_HEADER arrives in Step 2. Unbundling with the wrong format
+    # would silently misparse the bytes, so we wait.
     try:
         raw_bundle = rsa_decrypt(private_key, encrypted_bundle)
-        aes_key, hmac_key = unbundle_keys(raw_bundle)
     except Exception as exc:
         raise HandshakeError(f"Key bundle decryption failed: {exc}") from exc
 
@@ -305,16 +310,29 @@ def perform_transfer(
         filename     = header["filename"]
         file_size    = header["file_size"]
         total_chunks = header["total_chunks"]
-        iv           = header["iv"]     # bytes (parse_file_header decodes hex → bytes)
-        hmac_digest  = header["hmac"]   # bytes — key is "hmac", not "hmac_digest"
         chunk_size   = header["chunk_size"]   # bytes/chunk the sender used (display only)
+        cipher_mode  = header["cipher_mode"]
     except Exception as exc:
         raise SessionError(f"Failed to parse FILE_HEADER: {exc}") from exc
 
     log_info(
         f"Incoming file : '{filename}'  "
-        f"({file_size:,} bytes, {total_chunks} chunk(s) of {chunk_size // 1024} KB)"
+        f"({file_size:,} bytes, {total_chunks} chunk(s) of {chunk_size // 1024} KB, "
+        f"{cipher_mode})"
     )
+
+    # Now that cipher_mode is known, unbundle the RSA-decrypted key material
+    # with the matching format.
+    try:
+        if cipher_mode == "AES-256-GCM":
+            aes_key    = unbundle_keys_gcm(raw_bundle)
+            base_nonce = header["nonce"]
+        else:
+            aes_key, hmac_key = unbundle_keys(raw_bundle)
+            iv          = header["iv"]     # bytes (parse_file_header decodes hex → bytes)
+            hmac_digest = header["hmac"]   # bytes — key is "hmac", not "hmac_digest"
+    except Exception as exc:
+        raise HandshakeError(f"Failed to unbundle keys for {cipher_mode}: {exc}") from exc
 
     # ── Steps 3-4: Receive FILE_CHUNK packets, decrypting each AS IT ARRIVES ─
     # Still within the bulk_transfer_seconds window started at Step 2. Real
@@ -333,58 +351,87 @@ def perform_transfer(
     log_info(f"Receiving and decrypting '{filename}'…")
     progress = ProgressBar(total_chunks, filename, chunk_size=chunk_size)
 
-    # SECURITY NOTE (padding-oracle mitigation): a CBC padding failure here
-    # and an HMAC failure below are DIFFERENT internal error conditions,
-    # but an adversary on the network must NOT be able to tell them apart
-    # from the outside. Both paths therefore:
-    #   (a) send the exact same GENERIC_VERIFICATION_ERROR message — never
-    #       a padding-specific or HMAC-specific one,
-    #   (b) go through the same _send_generic_failure() helper, which adds
-    #       a small fixed delay to reduce (not eliminate — see paper
-    #       Security Analysis) timing distinguishability between "failed
-    #       during decryption" and "failed during HMAC verification".
-    # This does not make the underlying MAC-then-encrypt construction as
-    # safe as encrypt-then-MAC would be — it only removes the specific
-    # oracle an attacker would otherwise get from this implementation's
-    # error handling. The AES-GCM migration (Section VIII, future work)
-    # removes the padding step — and therefore this entire attack class —
-    # altogether.
-    try:
-        decrypt_file_stream(
-            _receive_encrypted_chunks(conn, total_chunks, progress),
-            aes_key,
-            iv,
-            str(tmp_decrypted_path),
-            total_chunks,
-        )
-    except SecureTransferError as exc:
-        tmp_decrypted_path.unlink(missing_ok=True)
-        _send_generic_failure(conn)
-        raise
-    except Exception as exc:
-        tmp_decrypted_path.unlink(missing_ok=True)
-        _send_generic_failure(conn)
-        raise SessionError(f"Receive/decrypt failed: {exc}") from exc
-    t_bulk_done = time.perf_counter()
-    log_info(f"Receive+decrypt completed in {t_bulk_done - t_bulk_start:.4f}s")
+    if cipher_mode == "AES-256-GCM":
+        # GCM decrypts and authenticates each chunk in ONE call
+        # (decrypt_and_verify) — there is no separate padding step and
+        # therefore no padding-failure-vs-authentication-failure
+        # distinction to leak in the first place. Still routed through
+        # _send_generic_failure for a consistent network-visible response,
+        # but structurally there is only one failure mode here, not two.
+        try:
+            decrypt_file_stream_gcm(
+                _receive_encrypted_chunks(conn, total_chunks, progress),
+                aes_key,
+                base_nonce,
+                str(tmp_decrypted_path),
+                total_chunks,
+            )
+        except SecureTransferError:
+            tmp_decrypted_path.unlink(missing_ok=True)
+            _send_generic_failure(conn)
+            raise
+        except Exception as exc:
+            tmp_decrypted_path.unlink(missing_ok=True)
+            _send_generic_failure(conn)
+            raise SessionError(f"Receive/decrypt failed: {exc}") from exc
+        t_bulk_done   = time.perf_counter()
+        t_verify_done = t_bulk_done   # no separate verify phase for GCM
+        log_info(f"Receive+decrypt+verify (GCM) completed in {t_bulk_done - t_bulk_start:.4f}s")
 
-    # ── Step 5: Verify HMAC ─────────────────────────────────────────────────
-    log_info("Verifying HMAC-SHA256 integrity…")
-    try:
-        # verify_hmac(hmac_key, filepath, expected_hmac) → True or raises IntegrityError
-        verify_hmac(hmac_key, str(tmp_decrypted_path), hmac_digest)
-    except IntegrityError:
-        tmp_decrypted_path.unlink(missing_ok=True)
-        _send_generic_failure(conn)
-        raise
-    except Exception as exc:
-        tmp_decrypted_path.unlink(missing_ok=True)
-        _send_generic_failure(conn)
-        raise IntegrityError(f"HMAC verification error: {exc}") from exc
-    t_verify_done = time.perf_counter()
+    else:
+        # SECURITY NOTE (padding-oracle mitigation): a CBC padding failure
+        # here and an HMAC failure below are DIFFERENT internal error
+        # conditions, but an adversary on the network must NOT be able to
+        # tell them apart from the outside. Both paths therefore:
+        #   (a) send the exact same GENERIC_VERIFICATION_ERROR message —
+        #       never a padding-specific or HMAC-specific one,
+        #   (b) go through the same _send_generic_failure() helper, which
+        #       adds a small fixed delay to reduce (not eliminate — see
+        #       paper Security Analysis) timing distinguishability between
+        #       "failed during decryption" and "failed during HMAC
+        #       verification".
+        # This does not make the underlying MAC-then-encrypt construction
+        # as safe as encrypt-then-MAC would be — it only removes the
+        # specific oracle this implementation's error handling created.
+        # The AES-256-GCM path above removes the padding step — and
+        # therefore this entire attack class — structurally, which is why
+        # GCM is the default cipher_mode now.
+        try:
+            decrypt_file_stream(
+                _receive_encrypted_chunks(conn, total_chunks, progress),
+                aes_key,
+                iv,
+                str(tmp_decrypted_path),
+                total_chunks,
+            )
+        except SecureTransferError:
+            tmp_decrypted_path.unlink(missing_ok=True)
+            _send_generic_failure(conn)
+            raise
+        except Exception as exc:
+            tmp_decrypted_path.unlink(missing_ok=True)
+            _send_generic_failure(conn)
+            raise SessionError(f"Receive/decrypt failed: {exc}") from exc
+        t_bulk_done = time.perf_counter()
+        log_info(f"Receive+decrypt completed in {t_bulk_done - t_bulk_start:.4f}s")
+
+        # ── Step 5 (CBC only): Verify whole-file HMAC ───────────────────────
+        log_info("Verifying HMAC-SHA256 integrity…")
+        try:
+            # verify_hmac(hmac_key, filepath, expected_hmac) → True or raises IntegrityError
+            verify_hmac(hmac_key, str(tmp_decrypted_path), hmac_digest)
+        except IntegrityError:
+            tmp_decrypted_path.unlink(missing_ok=True)
+            _send_generic_failure(conn)
+            raise
+        except Exception as exc:
+            tmp_decrypted_path.unlink(missing_ok=True)
+            _send_generic_failure(conn)
+            raise IntegrityError(f"HMAC verification error: {exc}") from exc
+        t_verify_done = time.perf_counter()
 
     checksum = compute_sha256(str(tmp_decrypted_path))
-    log_info(f"✓ HMAC verified.  SHA-256: {checksum}")
+    log_info(f"✓ Integrity verified.  SHA-256: {checksum}")
 
     # ── Step 6: Send ACK ────────────────────────────────────────────────────
     send_packet(conn, PacketType.ACK, build_ack())
@@ -415,6 +462,7 @@ def perform_transfer(
 
     stats = {
         "role"                  : "receiver",
+        "cipher_mode"           : cipher_mode,
         "file_size_bytes"       : file_size,
         "chunk_size_bytes"      : chunk_size,
         "total_chunks"          : total_chunks,

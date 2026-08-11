@@ -51,6 +51,9 @@ try:
         compute_hmac,
         compute_sha256,
         compute_total_chunks,
+        generate_session_key_gcm,
+        bundle_keys_gcm,
+        encrypt_file_stream_gcm,
     )
     from protocol import (
         send_packet,
@@ -147,6 +150,7 @@ def perform_transfer(
     file_path: Path,
     session: TransferSession,
     chunk_size: int = DEFAULT_CHUNK_SIZE,
+    cipher_mode: str = "AES-256-GCM",
 ) -> dict:
     """
     Execute the full handshake + file transfer over an established socket.
@@ -159,6 +163,11 @@ def perform_transfer(
                      see crypto_utils.encrypt_file_stream). Defaults to the
                      historical 64 KB. Exposed for the benchmark suite's
                      chunk-size sweep.
+        cipher_mode: "AES-256-GCM" (default) or "AES-256-CBC". GCM is the
+                     recommended mode — no padding step, per-chunk
+                     authentication, no separate HMAC pass. CBC is kept
+                     available for comparison/benchmarking against the
+                     original design (see paper Results section).
 
     Returns:
         A stats dict with wall-clock timings (handshake_seconds,
@@ -167,6 +176,9 @@ def perform_transfer(
         in-memory encryption loop. Used by --bench-report; harmless/ignored
         for normal (non-benchmark) runs.
     """
+    if cipher_mode not in ("AES-256-GCM", "AES-256-CBC"):
+        raise ValueError(f"Unknown cipher_mode: {cipher_mode!r}")
+
     filename = file_path.name
     file_size = file_path.stat().st_size
 
@@ -177,26 +189,31 @@ def perform_transfer(
     # ── Steps 1-3: HELLO → generate session keys → KEY_EXCHANGE ────────────
     # perform_sender_handshake() owns the whole exchange: it receives HELLO,
     # extracts the receiver's public key PEM, hands that PEM to our
-    # build_bundle() callback (which generates the AES/HMAC session keys and
+    # build_bundle() callback (which generates the session key(s) and
     # RSA-encrypts them), and sends the resulting bundle as KEY_EXCHANGE.
-    # This function must run the RSA import/generation/encryption itself
-    # because it only learns the receiver's PEM *inside* the handshake call —
-    # session_keys is populated as a side effect so we can use aes_key/iv/
-    # hmac_key afterward.
-    log_info("Performing handshake with receiver…")
+    # session_keys is populated as a side effect so we can use the key
+    # material afterward, since it's only generated *inside* the callback
+    # (after we've actually seen the receiver's public key).
+    log_info(f"Performing handshake with receiver… (cipher_mode={cipher_mode})")
     session_keys = {}
 
     def build_bundle(receiver_pubkey_pem: bytes) -> bytes:
         from Crypto.PublicKey import RSA
         receiver_pubkey = RSA.import_key(receiver_pubkey_pem)
 
-        aes_key, iv = generate_session_key()   # returns (aes_key, iv)
-        hmac_key    = generate_hmac_key()
-        session_keys["aes_key"]  = aes_key
-        session_keys["iv"]       = iv
-        session_keys["hmac_key"] = hmac_key
+        if cipher_mode == "AES-256-GCM":
+            aes_key, base_nonce = generate_session_key_gcm()
+            session_keys["aes_key"]     = aes_key
+            session_keys["base_nonce"]  = base_nonce
+            bundle = bundle_keys_gcm(aes_key)
+        else:
+            aes_key, iv = generate_session_key()
+            hmac_key    = generate_hmac_key()
+            session_keys["aes_key"]  = aes_key
+            session_keys["iv"]       = iv
+            session_keys["hmac_key"] = hmac_key
+            bundle = bundle_keys(aes_key, hmac_key)
 
-        bundle = bundle_keys(aes_key, hmac_key)
         return rsa_encrypt(receiver_pubkey, bundle)
 
     try:
@@ -204,25 +221,27 @@ def perform_transfer(
     except Exception as exc:
         raise HandshakeError(f"Handshake failed: {exc}") from exc
 
-    aes_key  = session_keys["aes_key"]
-    iv       = session_keys["iv"]
-    hmac_key = session_keys["hmac_key"]
+    aes_key = session_keys["aes_key"]
 
     t_handshake_done = time.perf_counter()
     log_info(f"Handshake complete — session keys established. "
              f"({t_handshake_done - t_start:.4f}s)")
 
-    # ── Step 4: Compute HMAC + checksum of plaintext file ──────────────────
-    log_info(f"Computing HMAC-SHA256 of '{filename}' ({file_size:,} bytes)…")
-    try:
-        # compute_hmac(hmac_key, filepath) — key first, path second
-        hmac_digest   = compute_hmac(hmac_key, str(file_path))
-        file_checksum = compute_sha256(str(file_path))
-    except Exception as exc:
-        raise SessionError(f"Failed to compute file integrity values: {exc}") from exc
-
+    # ── Step 4: For CBC only — compute whole-file HMAC + checksum ──────────
+    # GCM skips this entirely: authentication happens per-chunk during
+    # streaming (Step 6), not as a separate whole-file pass beforehand.
+    # compute_sha256 is always computed either way — it is NOT a security
+    # mechanism, just an informational checksum used for logging/display.
+    file_checksum = compute_sha256(str(file_path))
     log_info(f"SHA-256  : {file_checksum}")
-    log_info(f"HMAC-256 : {hmac_digest.hex()[:32]}…")
+
+    if cipher_mode == "AES-256-CBC":
+        log_info(f"Computing HMAC-SHA256 of '{filename}' ({file_size:,} bytes)…")
+        try:
+            hmac_digest = compute_hmac(session_keys["hmac_key"], str(file_path))
+        except Exception as exc:
+            raise SessionError(f"Failed to compute file integrity values: {exc}") from exc
+        log_info(f"HMAC-256 : {hmac_digest.hex()[:32]}…")
 
     # ── Step 5: Send FILE_HEADER ────────────────────────────────────────────
     # Bulk-transfer timing starts here — this is the phase whose latency
@@ -231,14 +250,25 @@ def perform_transfer(
     # not included in either bucket since it never touches the socket).
     t_bulk_start = time.perf_counter()
 
-    header_payload = build_file_header(
-        filename     = filename,
-        file_size    = file_size,
-        total_chunks = total_chunks,
-        iv           = iv,
-        hmac_digest  = hmac_digest,
-        chunk_size   = chunk_size,
-    )
+    if cipher_mode == "AES-256-GCM":
+        header_payload = build_file_header(
+            filename     = filename,
+            file_size    = file_size,
+            total_chunks = total_chunks,
+            chunk_size   = chunk_size,
+            cipher_mode  = cipher_mode,
+            nonce        = session_keys["base_nonce"],
+        )
+    else:
+        header_payload = build_file_header(
+            filename     = filename,
+            file_size    = file_size,
+            total_chunks = total_chunks,
+            iv           = session_keys["iv"],
+            hmac_digest  = hmac_digest,
+            chunk_size   = chunk_size,
+            cipher_mode  = cipher_mode,
+        )
     send_packet(conn, PacketType.FILE_HEADER, header_payload)
     log_info(f"FILE_HEADER sent → {total_chunks} chunk(s) of {chunk_size // 1024} KB")
 
@@ -247,8 +277,17 @@ def perform_transfer(
     progress  = ProgressBar(total_chunks, filename, chunk_size=chunk_size)
     chunk_num = 0
 
+    if cipher_mode == "AES-256-GCM":
+        chunk_generator = encrypt_file_stream_gcm(
+            str(file_path), aes_key, session_keys["base_nonce"], chunk_size=chunk_size
+        )
+    else:
+        chunk_generator = encrypt_file_stream(
+            str(file_path), aes_key, session_keys["iv"], chunk_size=chunk_size
+        )
+
     try:
-        for encrypted_chunk in encrypt_file_stream(str(file_path), aes_key, iv, chunk_size=chunk_size):
+        for encrypted_chunk in chunk_generator:
             chunk_num += 1
             send_packet(conn, PacketType.FILE_CHUNK, build_file_chunk(encrypted_chunk))
             progress.update(chunk_num)
@@ -295,6 +334,7 @@ def perform_transfer(
 
     return {
         "role"                  : "sender",
+        "cipher_mode"           : cipher_mode,
         "file_size_bytes"       : file_size,
         "chunk_size_bytes"      : chunk_size,
         "total_chunks"          : total_chunks,
@@ -328,6 +368,7 @@ def run_server(
     port: int,
     chunk_size: int = DEFAULT_CHUNK_SIZE,
     bench_report: Optional[Path] = None,
+    cipher_mode: str = "AES-256-GCM",
 ):
     """
     Start the TCP server, accept one receiver, run the full transfer, shut down.
@@ -339,6 +380,7 @@ def run_server(
                         etc.) after the transfer finishes — success or
                         failure. Used by the benchmark suite; no effect on
                         normal transfers when omitted.
+        cipher_mode:   "AES-256-GCM" (default) or "AES-256-CBC".
     """
     if not file_path.exists():
         log_error(f"File not found: {file_path}")
@@ -384,7 +426,7 @@ def run_server(
         try:
             with conn:
                 conn.settimeout(ACK_TIMEOUT)
-                stats = perform_transfer(conn, file_path, session, chunk_size=chunk_size)
+                stats = perform_transfer(conn, file_path, session, chunk_size=chunk_size, cipher_mode=cipher_mode)
                 print(f"\n  ✓ Transfer complete.")
 
         except HandshakeError as exc:
@@ -498,6 +540,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--cipher-mode",
+        choices=["gcm", "cbc"],
+        default="gcm",
+        help=(
+            "AES cipher mode. 'gcm' (default, recommended): authenticated "
+            "encryption, no padding step, per-chunk integrity. 'cbc': the "
+            "original CBC+HMAC design, kept for comparison/benchmarking."
+        ),
+    )
+    parser.add_argument(
         "--bench-report",
         type=str,
         default=None,
@@ -542,6 +594,7 @@ def main():
         args.port,
         chunk_size=args.chunk_size,
         bench_report=Path(args.bench_report) if args.bench_report else None,
+        cipher_mode="AES-256-GCM" if args.cipher_mode == "gcm" else "AES-256-CBC",
     )
 
 

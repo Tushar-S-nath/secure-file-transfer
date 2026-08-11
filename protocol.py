@@ -204,9 +204,11 @@ def build_file_header(
     filename: str,
     file_size: int,
     total_chunks: int,
-    iv: bytes,
-    hmac_digest: bytes,
+    iv: bytes = None,
+    hmac_digest: bytes = None,
     chunk_size: int = 65536,
+    cipher_mode: str = "AES-256-CBC",
+    nonce: bytes = None,
 ) -> bytes:
     """
     FILE_HEADER payload — JSON-encoded file metadata.
@@ -216,22 +218,36 @@ def build_file_header(
         filename     : original filename (basename only, no path)
         file_size    : total file size in bytes
         total_chunks : how many FILE_CHUNK packets to expect
-        iv           : AES initialization vector (hex-encoded)
-        hmac         : HMAC-SHA256 of the plaintext file (hex-encoded)
         version      : protocol version number
-        chunk_size   : plaintext bytes per chunk the sender used (needed
-                       by the receiver's progress display; defaults to
-                       the historical 64 KB for callers that don't pass
-                       one, e.g. existing tests)
+        chunk_size   : plaintext bytes per chunk the sender used
+        cipher_mode  : "AES-256-CBC" (default) or "AES-256-GCM"
+        iv           : AES-CBC initialization vector, hex-encoded.
+                       Required for cipher_mode="AES-256-CBC".
+        hmac         : whole-file HMAC-SHA256, hex-encoded.
+                       Required for cipher_mode="AES-256-CBC".
+                       Not used for GCM (each chunk self-authenticates).
+        nonce        : 8-byte GCM session base nonce, hex-encoded.
+                       Required for cipher_mode="AES-256-GCM".
+
+    Backward compatible: existing callers that only pass iv/hmac_digest
+    (not cipher_mode/nonce) get cipher_mode="AES-256-CBC" by default,
+    identical to the original CBC-only header shape.
     """
+    if cipher_mode == "AES-256-CBC" and (iv is None or hmac_digest is None):
+        raise ValueError("AES-256-CBC header requires both iv and hmac_digest.")
+    if cipher_mode == "AES-256-GCM" and nonce is None:
+        raise ValueError("AES-256-GCM header requires nonce.")
+
     meta = {
         "filename"     : os.path.basename(filename),
         "file_size"    : file_size,
         "total_chunks" : total_chunks,
-        "iv"           : iv.hex(),
-        "hmac"         : hmac_digest.hex(),
         "version"      : PROTOCOL_VERSION,
         "chunk_size"   : chunk_size,
+        "cipher_mode"  : cipher_mode,
+        "iv"           : iv.hex() if iv is not None else None,
+        "hmac"         : hmac_digest.hex() if hmac_digest is not None else None,
+        "nonce"        : nonce.hex() if nonce is not None else None,
     }
     return json.dumps(meta).encode("utf-8")
 
@@ -239,12 +255,36 @@ def build_file_header(
 def parse_file_header(payload: bytes) -> dict:
     """
     Parse FILE_HEADER payload → returns metadata dict.
-    Decodes hex fields back to bytes.
+    Decodes hex fields back to bytes (only the ones actually present —
+    a GCM header has no iv/hmac, a CBC header has no nonce).
+    "cipher_mode" defaults to "AES-256-CBC" if absent, for headers built
+    before this field existed.
+
+    Validates that the fields REQUIRED for the header's cipher_mode are
+    actually present, even though individual fields are optional at the
+    JSON level (since which ones are required depends on cipher_mode).
     """
     try:
         meta = json.loads(payload.decode("utf-8"))
-        meta["iv"]   = bytes.fromhex(meta["iv"])
-        meta["hmac"] = bytes.fromhex(meta["hmac"])
+
+        for required in ("filename", "file_size", "total_chunks"):
+            if required not in meta:
+                raise KeyError(required)
+
+        cipher_mode = meta.setdefault("cipher_mode", "AES-256-CBC")
+        if cipher_mode == "AES-256-CBC":
+            if not meta.get("iv") or not meta.get("hmac"):
+                raise KeyError("iv/hmac (required for AES-256-CBC)")
+        elif cipher_mode == "AES-256-GCM":
+            if not meta.get("nonce"):
+                raise KeyError("nonce (required for AES-256-GCM)")
+
+        if meta.get("iv"):
+            meta["iv"] = bytes.fromhex(meta["iv"])
+        if meta.get("hmac"):
+            meta["hmac"] = bytes.fromhex(meta["hmac"])
+        if meta.get("nonce"):
+            meta["nonce"] = bytes.fromhex(meta["nonce"])
         return meta
     except (json.JSONDecodeError, KeyError, ValueError) as e:
         raise PacketError("Failed to parse FILE_HEADER payload.", details=str(e))
