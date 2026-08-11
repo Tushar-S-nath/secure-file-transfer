@@ -84,6 +84,33 @@ DEFAULT_HOST    = "127.0.0.1"
 CONNECT_TIMEOUT = 30          # Seconds to wait for connection to sender
 RECV_TIMEOUT    = 120         # Seconds to wait between packets
 
+# Padding-oracle mitigation: ONE generic message used for every kind of
+# post-handshake verification failure (CBC padding failure, HMAC mismatch,
+# or any other decrypt-time error). Never send a message that reveals
+# WHICH check failed — see the SECURITY NOTE in perform_transfer() below.
+GENERIC_VERIFICATION_ERROR = "Transfer verification failed."
+
+# Small fixed delay before responding to any verification failure, to
+# reduce (not eliminate) timing distinguishability between a fast
+# padding-removal failure and a slower full-HMAC-recompute failure. This
+# is a practical mitigation, not a constant-time guarantee — see the
+# paper's Security Analysis for the honest limits of this approach.
+FAILURE_RESPONSE_DELAY_SECONDS = 0.25
+
+
+def _send_generic_failure(conn: socket.socket) -> None:
+    """Send the same generic ERROR packet regardless of whether the
+    underlying failure was a CBC padding error, an HMAC mismatch, or
+    something else — see GENERIC_VERIFICATION_ERROR."""
+    time.sleep(FAILURE_RESPONSE_DELAY_SECONDS)
+    try:
+        send_packet(conn, PacketType.ERROR, build_error(GENERIC_VERIFICATION_ERROR))
+    except OSError:
+        # Connection may already be gone (e.g. sender disconnected) —
+        # nothing more we can do, and this must not raise over the
+        # original error being handled by the caller.
+        pass
+
 
 def _peak_rss_kb() -> Optional[int]:
     """Peak resident set size of this process, in KB, for the whole process
@@ -306,6 +333,22 @@ def perform_transfer(
     log_info(f"Receiving and decrypting '{filename}'…")
     progress = ProgressBar(total_chunks, filename, chunk_size=chunk_size)
 
+    # SECURITY NOTE (padding-oracle mitigation): a CBC padding failure here
+    # and an HMAC failure below are DIFFERENT internal error conditions,
+    # but an adversary on the network must NOT be able to tell them apart
+    # from the outside. Both paths therefore:
+    #   (a) send the exact same GENERIC_VERIFICATION_ERROR message — never
+    #       a padding-specific or HMAC-specific one,
+    #   (b) go through the same _send_generic_failure() helper, which adds
+    #       a small fixed delay to reduce (not eliminate — see paper
+    #       Security Analysis) timing distinguishability between "failed
+    #       during decryption" and "failed during HMAC verification".
+    # This does not make the underlying MAC-then-encrypt construction as
+    # safe as encrypt-then-MAC would be — it only removes the specific
+    # oracle an attacker would otherwise get from this implementation's
+    # error handling. The AES-GCM migration (Section VIII, future work)
+    # removes the padding step — and therefore this entire attack class —
+    # altogether.
     try:
         decrypt_file_stream(
             _receive_encrypted_chunks(conn, total_chunks, progress),
@@ -314,11 +357,13 @@ def perform_transfer(
             str(tmp_decrypted_path),
             total_chunks,
         )
-    except SecureTransferError:
+    except SecureTransferError as exc:
         tmp_decrypted_path.unlink(missing_ok=True)
+        _send_generic_failure(conn)
         raise
     except Exception as exc:
         tmp_decrypted_path.unlink(missing_ok=True)
+        _send_generic_failure(conn)
         raise SessionError(f"Receive/decrypt failed: {exc}") from exc
     t_bulk_done = time.perf_counter()
     log_info(f"Receive+decrypt completed in {t_bulk_done - t_bulk_start:.4f}s")
@@ -330,13 +375,11 @@ def perform_transfer(
         verify_hmac(hmac_key, str(tmp_decrypted_path), hmac_digest)
     except IntegrityError:
         tmp_decrypted_path.unlink(missing_ok=True)
-        send_packet(
-            conn, PacketType.ERROR,
-            build_error("HMAC verification failed — file corrupted or tampered.")
-        )
+        _send_generic_failure(conn)
         raise
     except Exception as exc:
         tmp_decrypted_path.unlink(missing_ok=True)
+        _send_generic_failure(conn)
         raise IntegrityError(f"HMAC verification error: {exc}") from exc
     t_verify_done = time.perf_counter()
 
