@@ -22,6 +22,7 @@ Handshake Flow (Receiver side):
 """
 
 import argparse
+import json
 import os
 import shutil
 import socket
@@ -29,6 +30,13 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from typing import Optional
+
+try:
+    import resource   # Unix/Linux/macOS only — used for --bench-report peak RSS
+    _HAS_RESOURCE = True
+except ImportError:
+    _HAS_RESOURCE = False   # e.g. native Windows without WSL
 
 # ---------------------------------------------------------------------------
 # Graceful import with helpful error messages
@@ -66,11 +74,24 @@ except ImportError as exc:
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-CHUNK_SIZE      = 64 * 1024   # Must match sender's chunk size
+DEFAULT_CHUNK_SIZE = 64 * 1024   # historical default fallback; actual chunk_size
+                                  # used for THIS transfer is read from FILE_HEADER
+                                  # (only affects the progress-bar speed/ETA display —
+                                  # decrypt_file_stream() itself doesn't need it, see
+                                  # crypto_utils.decrypt_file_stream docstring)
 DEFAULT_PORT    = 9999
 DEFAULT_HOST    = "127.0.0.1"
 CONNECT_TIMEOUT = 30          # Seconds to wait for connection to sender
 RECV_TIMEOUT    = 120         # Seconds to wait between packets
+
+
+def _peak_rss_kb() -> Optional[int]:
+    """Peak resident set size of this process, in KB, for the whole process
+    lifetime so far. Returns None on platforms without the resource module."""
+    if not _HAS_RESOURCE:
+        return None
+    raw = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    return raw if sys.platform != "darwin" else raw // 1024
 
 
 # ---------------------------------------------------------------------------
@@ -79,10 +100,11 @@ RECV_TIMEOUT    = 120         # Seconds to wait between packets
 class ProgressBar:
     """Terminal progress bar with transfer speed and ETA."""
 
-    def __init__(self, total_chunks: int, filename: str):
+    def __init__(self, total_chunks: int, filename: str, chunk_size: int = DEFAULT_CHUNK_SIZE):
         self.total      = total_chunks
         self.current    = 0
         self.filename   = filename
+        self.chunk_size = chunk_size
         self.start_time = time.time()
         self.bar_width  = 40
 
@@ -93,10 +115,10 @@ class ProgressBar:
         filled   = int(self.bar_width * pct)
         bar      = "█" * filled + "░" * (self.bar_width - filled)
 
-        speed     = (self.current * CHUNK_SIZE) / (elapsed + 1e-9)
+        speed     = (self.current * self.chunk_size) / (elapsed + 1e-9)
         speed_str = self._fmt_speed(speed)
 
-        eta     = (self.total - self.current) * CHUNK_SIZE / (speed + 1e-9)
+        eta     = (self.total - self.current) * self.chunk_size / (speed + 1e-9)
         eta_str = self._fmt_time(eta) if self.current < self.total else "Done"
 
         print(
@@ -128,13 +150,81 @@ class ProgressBar:
 # ---------------------------------------------------------------------------
 # Core Transfer Logic
 # ---------------------------------------------------------------------------
+def _receive_encrypted_chunks(conn: socket.socket, total_chunks: int, progress: "ProgressBar"):
+    """
+    Generator: pulls FILE_CHUNK packets off the socket one at a time and
+    yields their encrypted payloads, so decrypt_file_stream() can decrypt
+    and write each chunk to disk as it arrives instead of the caller
+    buffering the entire encrypted file in memory first.
+
+    This is what keeps peak memory bounded by chunk_size rather than
+    growing with file size. (Previously this receiver collected every
+    encrypted chunk into a Python list -- encrypted_chunks = [];
+    .append() per chunk -- before decrypting any of it, despite an inline
+    comment claiming this kept memory bounded. It didn't: peak RSS scaled
+    with file size, contradicting the README's "constant <10MB footprint"
+    claim. The benchmark suite's peak_rss_kb measurements confirmed this
+    empirically before this fix.)
+
+    Any network or protocol error is raised as a SecureTransferError
+    subclass rather than left as a bare OSError. This matters because
+    decrypt_file_stream() wraps this generator's iteration in a
+    try/except (OSError, IOError) intended to catch local file-WRITE
+    errors -- a raw ConnectionResetError (which IS an OSError subclass)
+    propagating up from recv_packet() would otherwise get relabeled as a
+    misleading "File write error during decryption." SecureTransferError
+    is not an OSError subclass, so it passes through that handler
+    untouched and reaches perform_transfer()'s own except clause intact.
+
+    Raises:
+        SessionError on chunk-count mismatch, a sender-reported ERROR
+        packet, an unexpected packet type, or any network-level failure.
+    """
+    chunks_received = 0
+    while True:
+        try:
+            conn.settimeout(RECV_TIMEOUT)
+            ptype, payload = recv_packet(conn)
+        except SecureTransferError:
+            raise
+        except OSError as exc:
+            raise SessionError(
+                f"Socket error while receiving chunk {chunks_received + 1}: {exc}"
+            ) from exc
+
+        if ptype == PacketType.FILE_CHUNK:
+            chunks_received += 1
+            progress.update(chunks_received)
+            yield payload
+
+        elif ptype == PacketType.TRANSFER_END:
+            progress.finish()
+            if chunks_received != total_chunks:
+                raise SessionError(
+                    f"Chunk count mismatch: "
+                    f"expected {total_chunks}, received {chunks_received}"
+                )
+            log_info(f"TRANSFER_END received — {chunks_received}/{total_chunks} chunks.")
+            return
+
+        elif ptype == PacketType.ERROR:
+            raise SessionError(
+                f"Sender reported an error: {payload.decode(errors='replace')}"
+            )
+
+        else:
+            raise SessionError(
+                f"Unexpected packet type during transfer: {ptype}"
+            )
+
+
 def perform_transfer(
     conn: socket.socket,
     private_key,
     public_key_pem: bytes,
     output_dir: Path,
     session: TransferSession,
-) -> Path:
+) -> tuple:
     """
     Execute the full handshake + file reception over an established socket.
 
@@ -146,8 +236,12 @@ def perform_transfer(
         session:        TransferSession logger instance.
 
     Returns:
-        Path to the saved output file.
+        (output_path, stats) where stats is a dict of wall-clock timings
+        (handshake_seconds, bulk_transfer_seconds measured around the REAL
+        recv() calls, decrypt_seconds, hmac_verify_seconds, total_seconds)
+        and peak_rss_kb. Used by --bench-report; harmless for normal runs.
     """
+    t_start = time.perf_counter()
 
     # ── Step 1: Handshake ───────────────────────────────────────────────────
     # perform_receiver_handshake(sock, public_key_pem) → encrypted_bundle bytes
@@ -164,9 +258,15 @@ def perform_transfer(
     except Exception as exc:
         raise HandshakeError(f"Key bundle decryption failed: {exc}") from exc
 
-    log_info("Handshake complete — session keys recovered.")
+    t_handshake_done = time.perf_counter()
+    log_info(f"Handshake complete — session keys recovered. "
+             f"({t_handshake_done - t_start:.4f}s)")
 
     # ── Step 2: Receive FILE_HEADER ─────────────────────────────────────────
+    # Bulk-transfer timing starts here — real recv() calls, mirroring where
+    # sender.py starts its own bulk_transfer_seconds measurement.
+    t_bulk_start = time.perf_counter()
+
     log_info("Waiting for FILE_HEADER…")
     conn.settimeout(RECV_TIMEOUT)
     ptype, header_payload = recv_packet(conn)
@@ -180,81 +280,48 @@ def perform_transfer(
         total_chunks = header["total_chunks"]
         iv           = header["iv"]     # bytes (parse_file_header decodes hex → bytes)
         hmac_digest  = header["hmac"]   # bytes — key is "hmac", not "hmac_digest"
+        chunk_size   = header["chunk_size"]   # bytes/chunk the sender used (display only)
     except Exception as exc:
         raise SessionError(f"Failed to parse FILE_HEADER: {exc}") from exc
 
     log_info(
         f"Incoming file : '{filename}'  "
-        f"({file_size:,} bytes, {total_chunks} chunk(s))"
+        f"({file_size:,} bytes, {total_chunks} chunk(s) of {chunk_size // 1024} KB)"
     )
 
-    # ── Step 3: Receive FILE_CHUNK packets, collect encrypted chunks ────────
-    # decrypt_file_stream() takes a generator of encrypted chunks — we collect
-    # them here and pass as a generator so memory usage stays bounded.
-    encrypted_chunks = []
-
-    log_info(f"Receiving '{filename}'…")
-    progress = ProgressBar(total_chunks, filename)
-
-    try:
-        chunks_received = 0
-        while True:
-            conn.settimeout(RECV_TIMEOUT)
-            ptype, payload = recv_packet(conn)
-
-            if ptype == PacketType.FILE_CHUNK:
-                # build_file_chunk() returns raw encrypted bytes — no prefix to strip
-                encrypted_chunks.append(payload)
-                chunks_received += 1
-                progress.update(chunks_received)
-
-            elif ptype == PacketType.TRANSFER_END:
-                progress.finish()
-                log_info(
-                    f"TRANSFER_END received — "
-                    f"{chunks_received}/{total_chunks} chunks."
-                )
-                break
-
-            elif ptype == PacketType.ERROR:
-                raise SessionError(
-                    f"Sender reported an error: {payload.decode(errors='replace')}"
-                )
-
-            else:
-                raise SessionError(
-                    f"Unexpected packet type during transfer: {ptype}"
-                )
-
-        if chunks_received != total_chunks:
-            raise SessionError(
-                f"Chunk count mismatch: "
-                f"expected {total_chunks}, received {chunks_received}"
-            )
-
-    except Exception:
-        raise
-
-    # ── Step 4: Decrypt the collected chunks to a temp file ─────────────────
+    # ── Steps 3-4: Receive FILE_CHUNK packets, decrypting each AS IT ARRIVES ─
+    # Still within the bulk_transfer_seconds window started at Step 2. Real
+    # recv() calls interleaved with real decrypt+write calls -- receiving
+    # and decrypting are pipelined by design now (see
+    # _receive_encrypted_chunks docstring), so there's no separate
+    # decrypt_seconds bucket anymore: the whole point of the fix is that
+    # there's no longer a distinct "receive everything, then decrypt
+    # everything" phase boundary to measure separately.
     tmp_decrypted = tempfile.NamedTemporaryFile(
         delete=False, suffix=".dec", dir=tempfile.gettempdir()
     )
     tmp_decrypted_path = Path(tmp_decrypted.name)
     tmp_decrypted.close()
 
-    log_info("Decrypting received data…")
+    log_info(f"Receiving and decrypting '{filename}'…")
+    progress = ProgressBar(total_chunks, filename, chunk_size=chunk_size)
+
     try:
-        # decrypt_file_stream(encrypted_chunks_iter, aes_key, iv, output_path, total_chunks)
         decrypt_file_stream(
-            iter(encrypted_chunks),
+            _receive_encrypted_chunks(conn, total_chunks, progress),
             aes_key,
             iv,
             str(tmp_decrypted_path),
             total_chunks,
         )
+    except SecureTransferError:
+        tmp_decrypted_path.unlink(missing_ok=True)
+        raise
     except Exception as exc:
         tmp_decrypted_path.unlink(missing_ok=True)
-        raise SessionError(f"Decryption failed: {exc}") from exc
+        raise SessionError(f"Receive/decrypt failed: {exc}") from exc
+    t_bulk_done = time.perf_counter()
+    log_info(f"Receive+decrypt completed in {t_bulk_done - t_bulk_start:.4f}s")
 
     # ── Step 5: Verify HMAC ─────────────────────────────────────────────────
     log_info("Verifying HMAC-SHA256 integrity…")
@@ -271,6 +338,7 @@ def perform_transfer(
     except Exception as exc:
         tmp_decrypted_path.unlink(missing_ok=True)
         raise IntegrityError(f"HMAC verification error: {exc}") from exc
+    t_verify_done = time.perf_counter()
 
     checksum = compute_sha256(str(tmp_decrypted_path))
     log_info(f"✓ HMAC verified.  SHA-256: {checksum}")
@@ -296,18 +364,46 @@ def perform_transfer(
     shutil.move(str(tmp_decrypted_path), str(output_path))
     log_info(f"✓ File saved to: {output_path}")
 
+    t_end = time.perf_counter()
+
     # Update session with final info and mark complete
     session.bytes_transferred = file_size
     session.complete(checksum=checksum)
 
-    return output_path
+    stats = {
+        "role"                  : "receiver",
+        "file_size_bytes"       : file_size,
+        "chunk_size_bytes"      : chunk_size,
+        "total_chunks"          : total_chunks,
+        "handshake_seconds"     : t_handshake_done - t_start,
+        "bulk_transfer_seconds" : t_bulk_done - t_bulk_start,
+        "hmac_verify_seconds"   : t_verify_done - t_bulk_done,
+        "total_seconds"         : t_end - t_start,
+        "peak_rss_kb"           : _peak_rss_kb(),
+        "checksum"              : checksum,
+    }
+
+    return output_path, stats
 
 
 # ---------------------------------------------------------------------------
 # Client Lifecycle
 # ---------------------------------------------------------------------------
-def run_client(host: str, port: int, key_name: str, output_dir: Path):
-    """Connect to the sender and run the full secure file reception flow."""
+def run_client(
+    host: str,
+    port: int,
+    key_name: str,
+    output_dir: Path,
+    bench_report: Optional[Path] = None,
+):
+    """Connect to the sender and run the full secure file reception flow.
+
+    Args:
+        bench_report: if given, write a JSON file here with the stats dict
+            returned by perform_transfer after the transfer finishes —
+            success or failure. Used by the benchmark suite; no effect on
+            normal transfers when omitted.
+    """
 
     print("=" * 60)
     print("  Secure File Transfer — RECEIVER")
@@ -356,10 +452,12 @@ def run_client(host: str, port: int, key_name: str, output_dir: Path):
         peer_address=f"{host}:{port}",
     )
 
+    stats = None
+    exit_code = 0
     try:
         with sock:
             sock.settimeout(RECV_TIMEOUT)
-            output_path = perform_transfer(
+            output_path, stats = perform_transfer(
                 sock, private_key, public_key_pem, output_dir, session
             )
 
@@ -368,27 +466,44 @@ def run_client(host: str, port: int, key_name: str, output_dir: Path):
     except HandshakeError as exc:
         log_error(f"Handshake error: {exc}")
         session.fail(str(exc))
-        sys.exit(2)
+        exit_code = 2
 
     except IntegrityError as exc:
         log_error(f"Integrity error: {exc}")
         session.fail(str(exc))
-        sys.exit(3)
+        exit_code = 3
 
     except SessionError as exc:
         log_error(f"Session error: {exc}")
         session.fail(str(exc))
-        sys.exit(4)
+        exit_code = 4
 
     except SecureTransferError as exc:
         log_error(f"Transfer error: {exc}")
         session.fail(str(exc))
-        sys.exit(5)
+        exit_code = 5
 
     except (ConnectionResetError, BrokenPipeError) as exc:
         log_error(f"Connection lost mid-transfer: {exc}")
         session.fail(str(exc))
-        sys.exit(6)
+        exit_code = 6
+
+    finally:
+        if bench_report is not None:
+            report = stats if stats is not None else {
+                "role": "receiver", "status": "failed", "exit_code": exit_code,
+                "peak_rss_kb": _peak_rss_kb(),
+            }
+            report.setdefault("status", "success")
+            try:
+                bench_report.parent.mkdir(parents=True, exist_ok=True)
+                with open(bench_report, "w") as f:
+                    json.dump(report, f, indent=2)
+            except OSError as exc:
+                log_error(f"Failed to write bench report to {bench_report}: {exc}")
+
+    if exit_code != 0:
+        sys.exit(exit_code)
 
 
 # ---------------------------------------------------------------------------
@@ -441,6 +556,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Directory to save the received file. Default: ./received",
     )
     parser.add_argument(
+        "--bench-report",
+        type=str,
+        default=None,
+        metavar="PATH",
+        help=(
+            "Write a JSON file with per-transfer timing/memory stats "
+            "(handshake vs. bulk-transfer latency, decrypt/HMAC-verify "
+            "time, peak RSS) to PATH after the transfer finishes. Used by "
+            "the benchmark suite; has no effect on the transfer itself."
+        ),
+    )
+    parser.add_argument(
         "--version", "-v",
         action="version",
         version="secure-file-transfer receiver v1.0.0",
@@ -456,10 +583,11 @@ def main():
         parser.error(f"Invalid port: {args.port}. Must be between 1 and 65535.")
 
     run_client(
-        host       = args.host,
-        port       = args.port,
-        key_name   = args.key,
-        output_dir = Path(args.output),
+        host         = args.host,
+        port         = args.port,
+        key_name     = args.key,
+        output_dir   = Path(args.output),
+        bench_report = Path(args.bench_report) if args.bench_report else None,
     )
 
 

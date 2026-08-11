@@ -1,5 +1,22 @@
-keys/
-.venv/
+# Python
 __pycache__/
 *.pyc
-logs/
+.venv/
+venv/
+
+# Transfer artifacts / local test output
+received/*
+!received/.gitkeep
+logs/*.log
+logs/transfer_history.json
+bench_work/
+
+# Private keys — do NOT commit real private keys.
+# keygen.py regenerates these locally; only .gitkeep is tracked so the
+# directory exists in a fresh clone.
+keys/*.pem
+!keys/.gitkeep
+
+# OS
+.DS_Store
+Thumbs.db

@@ -205,7 +205,8 @@ def build_file_header(
     file_size: int,
     total_chunks: int,
     iv: bytes,
-    hmac_digest: bytes
+    hmac_digest: bytes,
+    chunk_size: int = 65536,
 ) -> bytes:
     """
     FILE_HEADER payload — JSON-encoded file metadata.
@@ -218,6 +219,10 @@ def build_file_header(
         iv           : AES initialization vector (hex-encoded)
         hmac         : HMAC-SHA256 of the plaintext file (hex-encoded)
         version      : protocol version number
+        chunk_size   : plaintext bytes per chunk the sender used (needed
+                       by the receiver's progress display; defaults to
+                       the historical 64 KB for callers that don't pass
+                       one, e.g. existing tests)
     """
     meta = {
         "filename"     : os.path.basename(filename),
@@ -226,6 +231,7 @@ def build_file_header(
         "iv"           : iv.hex(),
         "hmac"         : hmac_digest.hex(),
         "version"      : PROTOCOL_VERSION,
+        "chunk_size"   : chunk_size,
     }
     return json.dumps(meta).encode("utf-8")
 
@@ -270,26 +276,48 @@ def build_error(message: str) -> bytes:
 
 def perform_sender_handshake(
     sock: socket.socket,
-    encrypted_bundle: bytes
+    bundle_or_builder
 ) -> None:
     """
     Sender side of the handshake:
-      1. Wait for HELLO from receiver (contains their public key — already used
-         by caller to encrypt the bundle before calling this function)
-      2. Send KEY_EXCHANGE with the encrypted AES+HMAC bundle
+      1. Wait for HELLO from receiver, extracting their public key PEM.
+      2. Obtain the RSA-encrypted (AES key + HMAC key) bundle.
+      3. Send KEY_EXCHANGE with the encrypted bundle.
+
+    `bundle_or_builder` accepts two forms, for two different callers:
+
+      * bytes — an already-encrypted bundle. This is the original API,
+        for a caller that (for whatever reason) already has the
+        receiver's public key and pre-built the bundle before calling
+        this function. Used by the existing test suite.
+
+      * callable — a function `builder(receiver_pubkey_pem: bytes) ->
+        bytes`. This lets a caller build the bundle *after* this
+        function receives the real HELLO and extracts the receiver's
+        public key, without the caller needing its own separate
+        recv_packet() call for HELLO (which would otherwise try to
+        read a second HELLO that's never sent, since only one is ever
+        transmitted). sender.py uses this form.
 
     Args:
-        sock              : connected socket to the receiver
-        encrypted_bundle  : RSA-encrypted (AES key + HMAC key) bytes
+        sock               : connected socket to the receiver
+        bundle_or_builder  : RSA-encrypted bundle bytes, or a callable
+                              as described above.
     """
-    # Step 1 — Expect HELLO (caller already received and used the public key,
-    # so we just validate the packet type here for protocol correctness)
-    ptype, _ = recv_packet(sock)
+    # Step 1 — Expect HELLO, extracting the receiver's public key PEM
+    # (needed for the callable form; harmless to parse either way).
+    ptype, hello_payload = recv_packet(sock)
     if ptype != PacketType.HELLO:
         raise HandshakeError(
             "Expected HELLO from receiver.",
             details=f"Got packet type: {ptype}"
         )
+
+    if callable(bundle_or_builder):
+        receiver_pubkey_pem = parse_hello(hello_payload)
+        encrypted_bundle = bundle_or_builder(receiver_pubkey_pem)
+    else:
+        encrypted_bundle = bundle_or_builder
 
     # Step 2 — Send KEY_EXCHANGE
     send_packet(sock, PacketType.KEY_EXCHANGE, build_key_exchange(encrypted_bundle))

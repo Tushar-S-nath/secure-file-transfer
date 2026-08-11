@@ -176,10 +176,11 @@ def decrypt_chunk(cipher: AES, chunk: bytes, is_last: bool) -> bytes:
 def encrypt_file_stream(
     filepath: str,
     aes_key: bytes,
-    iv: bytes
+    iv: bytes,
+    chunk_size: int = CHUNK_SIZE,
 ) -> Generator[bytes, None, None]:
     """
-    Generator that encrypts a file in 64 KB chunks and yields each
+    Generator that encrypts a file in fixed-size chunks and yields each
     encrypted chunk. Handles files of any size — including 30 GB+ —
     without loading the entire file into memory.
 
@@ -188,9 +189,16 @@ def encrypt_file_stream(
             socket.send(encrypted_chunk)
 
     Args:
-        filepath : absolute or relative path to the source file
-        aes_key  : 32-byte AES-256 session key
-        iv       : 16-byte initialization vector
+        filepath   : absolute or relative path to the source file
+        aes_key    : 32-byte AES-256 session key
+        iv         : 16-byte initialization vector
+        chunk_size : plaintext bytes read per chunk before encryption.
+                     Defaults to the module-level CHUNK_SIZE (64 KB).
+                     Exposed so callers (e.g. sender.py's --chunk-size
+                     flag and the benchmark suite's chunk-size sweep)
+                     can override it; decrypt_file_stream does not need
+                     the matching value since it just consumes whatever
+                     chunks it is handed.
 
     Yields:
         Encrypted bytes, one chunk at a time
@@ -208,7 +216,7 @@ def encrypt_file_stream(
     try:
         with open(filepath, "rb") as f:
             while True:
-                chunk = f.read(CHUNK_SIZE)
+                chunk = f.read(chunk_size)
                 if not chunk:
                     break
                 bytes_read += len(chunk)
@@ -268,9 +276,11 @@ def compute_hmac(hmac_key: bytes, filepath: str) -> bytes:
     over the decrypted file and compares — if they match, the file
     arrived intact and untampered.
 
-    This is the Encrypt-then-MAC approach: we MAC the plaintext,
-    not the ciphertext, which is simpler to reason about for a
-    file transfer protocol.
+    Note on terminology: this is a MAC-then-encrypt construction (the
+    HMAC is computed over the plaintext, before encryption), NOT
+    encrypt-then-MAC (which would compute the HMAC over the ciphertext).
+    See the paper's Security Analysis section for the implications of
+    this choice, including its relationship to CBC padding-oracle risk.
 
     Args:
         hmac_key : 32-byte key for HMAC
@@ -345,13 +355,16 @@ def compute_sha256(filepath: str) -> str:
         raise EncryptionError("Failed to compute SHA-256 checksum.", details=str(e))
 
 
-def compute_total_chunks(filepath: str) -> int:
+def compute_total_chunks(filepath: str, chunk_size: int = CHUNK_SIZE) -> int:
     """
-    Calculate how many 64 KB chunks a file will produce.
-    Used by the receiver to know when to apply final-chunk unpadding.
+    Calculate how many chunks of `chunk_size` bytes a file will produce.
+    Used by the sender to populate FILE_HEADER and by the receiver to
+    know when to apply final-chunk unpadding. Must be called with the
+    SAME chunk_size the sender actually used for encryption (sender.py
+    passes its --chunk-size value here for exactly this reason).
     """
     file_size = os.path.getsize(filepath)
-    return max(1, -(-file_size // CHUNK_SIZE))   # ceiling division
+    return max(1, -(-file_size // chunk_size))   # ceiling division
 
 
 # ══════════════════════════════════════════════════════════════════════════════

@@ -24,11 +24,19 @@ Handshake Flow (Sender side):
 """
 
 import argparse
+import json
 import os
 import socket
 import sys
 import time
 from pathlib import Path
+from typing import Optional
+
+try:
+    import resource   # Unix/Linux/macOS only — used for --bench-report peak RSS
+    _HAS_RESOURCE = True
+except ImportError:
+    _HAS_RESOURCE = False   # e.g. native Windows without WSL
 
 # ---------------------------------------------------------------------------
 # Graceful import with helpful error messages
@@ -53,7 +61,6 @@ try:
         build_file_chunk,
         build_transfer_end,
         build_error,
-        parse_hello,
     )
     from keygen import load_private_key, load_public_key
     from logger import TransferSession, log_info, log_error
@@ -71,7 +78,7 @@ except ImportError as exc:
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-CHUNK_SIZE     = 64 * 1024   # 64 KB — matches crypto_utils CHUNK_SIZE
+DEFAULT_CHUNK_SIZE = 64 * 1024   # 64 KB — historical default, matches crypto_utils
 DEFAULT_PORT   = 9999
 DEFAULT_HOST   = "0.0.0.0"   # Listen on all interfaces
 SOCKET_TIMEOUT = 60          # Seconds to wait for receiver to connect
@@ -85,10 +92,11 @@ BACKLOG        = 1           # Accept one connection at a time
 class ProgressBar:
     """Terminal progress bar with transfer speed and ETA."""
 
-    def __init__(self, total_chunks: int, filename: str):
+    def __init__(self, total_chunks: int, filename: str, chunk_size: int = DEFAULT_CHUNK_SIZE):
         self.total      = total_chunks
         self.current    = 0
         self.filename   = filename
+        self.chunk_size = chunk_size
         self.start_time = time.time()
         self.bar_width  = 40
 
@@ -99,10 +107,10 @@ class ProgressBar:
         filled   = int(self.bar_width * pct)
         bar      = "█" * filled + "░" * (self.bar_width - filled)
 
-        speed     = (self.current * CHUNK_SIZE) / (elapsed + 1e-9)
+        speed     = (self.current * self.chunk_size) / (elapsed + 1e-9)
         speed_str = self._fmt_speed(speed)
 
-        eta     = (self.total - self.current) * CHUNK_SIZE / (speed + 1e-9)
+        eta     = (self.total - self.current) * self.chunk_size / (speed + 1e-9)
         eta_str = self._fmt_time(eta) if self.current < self.total else "Done"
 
         print(
@@ -134,87 +142,75 @@ class ProgressBar:
 # ---------------------------------------------------------------------------
 # Core Transfer Logic
 # ---------------------------------------------------------------------------
-def perform_transfer(conn: socket.socket, file_path: Path, session: TransferSession):
+def perform_transfer(
+    conn: socket.socket,
+    file_path: Path,
+    session: TransferSession,
+    chunk_size: int = DEFAULT_CHUNK_SIZE,
+) -> dict:
     """
     Execute the full handshake + file transfer over an established socket.
 
     Args:
-        conn:       Accepted client socket (the receiver).
-        file_path:  Path to the plaintext file to send.
-        session:    TransferSession logger instance.
+        conn:        Accepted client socket (the receiver).
+        file_path:   Path to the plaintext file to send.
+        session:     TransferSession logger instance.
+        chunk_size:  Plaintext bytes per chunk (must be a multiple of 16 —
+                     see crypto_utils.encrypt_file_stream). Defaults to the
+                     historical 64 KB. Exposed for the benchmark suite's
+                     chunk-size sweep.
+
+    Returns:
+        A stats dict with wall-clock timings (handshake_seconds,
+        bulk_transfer_seconds, ack_wait_seconds, total_seconds) measured
+        around the REAL send()/recv() calls on this socket — not just the
+        in-memory encryption loop. Used by --bench-report; harmless/ignored
+        for normal (non-benchmark) runs.
     """
     filename = file_path.name
     file_size = file_path.stat().st_size
 
-    # compute_total_chunks(filepath: str) — takes a path, not (size, chunk_size)
-    total_chunks = compute_total_chunks(str(file_path))
+    total_chunks = compute_total_chunks(str(file_path), chunk_size=chunk_size)
 
-    # ── Step 1: Receive HELLO → extract receiver's public key ──────────────
-    # We receive HELLO ourselves here so we can extract the public key PEM.
-    # perform_sender_handshake() also calls recv_packet() internally — it will
-    # receive the NEXT packet (KEY_EXCHANGE direction doesn't apply here, see
-    # protocol.py: it re-receives HELLO to validate, so we must NOT call
-    # recv_packet here first).
-    #
-    # Reading protocol.py carefully:
-    #   perform_sender_handshake(sock, encrypted_bundle):
-    #     1. recv_packet(sock)  → expects HELLO (consumes it)
-    #     2. send_packet(sock, KEY_EXCHANGE, encrypted_bundle)
-    #
-    # So the correct flow is:
-    #   - We generate keys and build the encrypted bundle BEFORE calling handshake
-    #   - But we need the receiver's public key to encrypt — so we must peek at
-    #     the HELLO first... except perform_sender_handshake consumes it.
-    #
-    # Solution: receive HELLO ourselves, extract pubkey, build bundle, then
-    # call perform_sender_handshake but bypass its internal recv by passing
-    # a pre-built bundle. Since perform_sender_handshake re-receives HELLO
-    # from the socket, we need to use a different approach:
-    #   receive HELLO → extract pubkey → generate keys → encrypt bundle →
-    #   manually send KEY_EXCHANGE (skip perform_sender_handshake's recv step)
-    #
-    # We replicate what perform_sender_handshake does but with the pubkey we
-    # already have, since the function's recv would block (HELLO already consumed).
+    t_start = time.perf_counter()
 
-    log_info("Waiting for HELLO from receiver…")
-    ptype, hello_payload = recv_packet(conn)
-    if ptype != PacketType.HELLO:
-        raise HandshakeError(f"Expected HELLO, got {ptype}")
+    # ── Steps 1-3: HELLO → generate session keys → KEY_EXCHANGE ────────────
+    # perform_sender_handshake() owns the whole exchange: it receives HELLO,
+    # extracts the receiver's public key PEM, hands that PEM to our
+    # build_bundle() callback (which generates the AES/HMAC session keys and
+    # RSA-encrypts them), and sends the resulting bundle as KEY_EXCHANGE.
+    # This function must run the RSA import/generation/encryption itself
+    # because it only learns the receiver's PEM *inside* the handshake call —
+    # session_keys is populated as a side effect so we can use aes_key/iv/
+    # hmac_key afterward.
+    log_info("Performing handshake with receiver…")
+    session_keys = {}
 
-    # parse_hello validates and returns the raw PEM bytes
-    try:
-        receiver_pubkey_pem = parse_hello(hello_payload)
-    except Exception as exc:
-        raise HandshakeError(f"Invalid HELLO payload: {exc}") from exc
-
-    log_info("HELLO received — receiver public key extracted.")
-
-    # ── Step 2: Generate session keys + encrypt bundle ─────────────────────
-    log_info("Generating session keys and performing handshake…")
-    try:
+    def build_bundle(receiver_pubkey_pem: bytes) -> bytes:
         from Crypto.PublicKey import RSA
         receiver_pubkey = RSA.import_key(receiver_pubkey_pem)
 
         aes_key, iv = generate_session_key()   # returns (aes_key, iv)
         hmac_key    = generate_hmac_key()
+        session_keys["aes_key"]  = aes_key
+        session_keys["iv"]       = iv
+        session_keys["hmac_key"] = hmac_key
 
-        bundle           = bundle_keys(aes_key, hmac_key)
-        encrypted_bundle = rsa_encrypt(receiver_pubkey, bundle)
-    except Exception as exc:
-        raise HandshakeError(f"Key generation/encryption failed: {exc}") from exc
+        bundle = bundle_keys(aes_key, hmac_key)
+        return rsa_encrypt(receiver_pubkey, bundle)
 
-    # ── Step 3: Send KEY_EXCHANGE ───────────────────────────────────────────
-    # perform_sender_handshake(sock, encrypted_bundle):
-    #   internally calls recv_packet → expects HELLO (already consumed above!)
-    # So we skip it and send KEY_EXCHANGE directly, which is all it does after
-    # receiving HELLO.
     try:
-        from protocol import build_key_exchange
-        send_packet(conn, PacketType.KEY_EXCHANGE, build_key_exchange(encrypted_bundle))
+        perform_sender_handshake(conn, build_bundle)
     except Exception as exc:
-        raise HandshakeError(f"Failed to send KEY_EXCHANGE: {exc}") from exc
+        raise HandshakeError(f"Handshake failed: {exc}") from exc
 
-    log_info("Handshake complete — session keys established.")
+    aes_key  = session_keys["aes_key"]
+    iv       = session_keys["iv"]
+    hmac_key = session_keys["hmac_key"]
+
+    t_handshake_done = time.perf_counter()
+    log_info(f"Handshake complete — session keys established. "
+             f"({t_handshake_done - t_start:.4f}s)")
 
     # ── Step 4: Compute HMAC + checksum of plaintext file ──────────────────
     log_info(f"Computing HMAC-SHA256 of '{filename}' ({file_size:,} bytes)…")
@@ -229,26 +225,30 @@ def perform_transfer(conn: socket.socket, file_path: Path, session: TransferSess
     log_info(f"HMAC-256 : {hmac_digest.hex()[:32]}…")
 
     # ── Step 5: Send FILE_HEADER ────────────────────────────────────────────
-    # build_file_header(filename, file_size, total_chunks, iv, hmac_digest)
+    # Bulk-transfer timing starts here — this is the phase whose latency
+    # comes from real send() calls over the socket, as opposed to handshake
+    # latency (above) or local-only HMAC/checksum computation (just above,
+    # not included in either bucket since it never touches the socket).
+    t_bulk_start = time.perf_counter()
+
     header_payload = build_file_header(
         filename     = filename,
         file_size    = file_size,
         total_chunks = total_chunks,
         iv           = iv,
         hmac_digest  = hmac_digest,
+        chunk_size   = chunk_size,
     )
     send_packet(conn, PacketType.FILE_HEADER, header_payload)
-    log_info(f"FILE_HEADER sent → {total_chunks} chunk(s) of {CHUNK_SIZE // 1024} KB")
+    log_info(f"FILE_HEADER sent → {total_chunks} chunk(s) of {chunk_size // 1024} KB")
 
     # ── Step 6: Stream FILE_CHUNK packets ───────────────────────────────────
-    # encrypt_file_stream(filepath, aes_key, iv) — no chunk_size argument
-    # build_file_chunk(encrypted_chunk)          — no chunk number argument
     log_info(f"Streaming '{filename}'…")
-    progress  = ProgressBar(total_chunks, filename)
+    progress  = ProgressBar(total_chunks, filename, chunk_size=chunk_size)
     chunk_num = 0
 
     try:
-        for encrypted_chunk in encrypt_file_stream(str(file_path), aes_key, iv):
+        for encrypted_chunk in encrypt_file_stream(str(file_path), aes_key, iv, chunk_size=chunk_size):
             chunk_num += 1
             send_packet(conn, PacketType.FILE_CHUNK, build_file_chunk(encrypted_chunk))
             progress.update(chunk_num)
@@ -267,7 +267,9 @@ def perform_transfer(conn: socket.socket, file_path: Path, session: TransferSess
 
     # ── Step 7: Send TRANSFER_END ───────────────────────────────────────────
     send_packet(conn, PacketType.TRANSFER_END, build_transfer_end())
-    log_info("TRANSFER_END sent — waiting for ACK…")
+    t_bulk_done = time.perf_counter()
+    log_info(f"TRANSFER_END sent — waiting for ACK… "
+             f"(bulk transfer: {t_bulk_done - t_bulk_start:.4f}s)")
 
     # ── Step 8: Receive ACK ─────────────────────────────────────────────────
     conn.settimeout(ACK_TIMEOUT)
@@ -275,6 +277,8 @@ def perform_transfer(conn: socket.socket, file_path: Path, session: TransferSess
         ptype, ack_payload = recv_packet(conn)
     except socket.timeout:
         raise SessionError("Timed out waiting for ACK from receiver.")
+
+    t_end = time.perf_counter()
 
     if ptype == PacketType.ERROR:
         raise IntegrityError(
@@ -289,13 +293,52 @@ def perform_transfer(conn: socket.socket, file_path: Path, session: TransferSess
     session.bytes_transferred = file_size
     session.complete(checksum=file_checksum)
 
+    return {
+        "role"                  : "sender",
+        "file_size_bytes"       : file_size,
+        "chunk_size_bytes"      : chunk_size,
+        "total_chunks"          : total_chunks,
+        "handshake_seconds"     : t_handshake_done - t_start,
+        "bulk_transfer_seconds" : t_bulk_done - t_bulk_start,
+        "ack_wait_seconds"      : t_end - t_bulk_done,
+        "total_seconds"         : t_end - t_start,
+        "peak_rss_kb"           : _peak_rss_kb(),
+        "checksum"              : file_checksum,
+    }
+
+
+def _peak_rss_kb() -> Optional[int]:
+    """Peak resident set size of this process, in KB, for the whole process
+    lifetime so far (Linux/macOS via getrusage's high-water-mark semantics).
+    Returns None on platforms without the resource module (e.g. native
+    Windows) rather than raising — memory profiling is best-effort."""
+    if not _HAS_RESOURCE:
+        return None
+    # ru_maxrss is KB on Linux, bytes on macOS — normalize to KB.
+    raw = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    return raw if sys.platform != "darwin" else raw // 1024
+
 
 # ---------------------------------------------------------------------------
 # Server Lifecycle
 # ---------------------------------------------------------------------------
-def run_server(file_path: Path, host: str, port: int):
+def run_server(
+    file_path: Path,
+    host: str,
+    port: int,
+    chunk_size: int = DEFAULT_CHUNK_SIZE,
+    bench_report: Optional[Path] = None,
+):
     """
     Start the TCP server, accept one receiver, run the full transfer, shut down.
+
+    Args:
+        chunk_size:    plaintext bytes per chunk (see perform_transfer).
+        bench_report:  if given, write a JSON file here with the stats dict
+                        returned by perform_transfer (timings, peak RSS,
+                        etc.) after the transfer finishes — success or
+                        failure. Used by the benchmark suite; no effect on
+                        normal transfers when omitted.
     """
     if not file_path.exists():
         log_error(f"File not found: {file_path}")
@@ -336,36 +379,55 @@ def run_server(file_path: Path, host: str, port: int):
         )
         log_info(f"Receiver connected from {peer_address}")
 
+        stats = None
+        exit_code = 0
         try:
             with conn:
                 conn.settimeout(ACK_TIMEOUT)
-                perform_transfer(conn, file_path, session)
+                stats = perform_transfer(conn, file_path, session, chunk_size=chunk_size)
                 print(f"\n  ✓ Transfer complete.")
 
         except HandshakeError as exc:
             log_error(f"Handshake error: {exc}")
             session.fail(str(exc))
-            sys.exit(2)
+            exit_code = 2
 
         except IntegrityError as exc:
             log_error(f"Integrity error: {exc}")
             session.fail(str(exc))
-            sys.exit(3)
+            exit_code = 3
 
         except SessionError as exc:
             log_error(f"Session error: {exc}")
             session.fail(str(exc))
-            sys.exit(4)
+            exit_code = 4
 
         except SecureTransferError as exc:
             log_error(f"Transfer error: {exc}")
             session.fail(str(exc))
-            sys.exit(5)
+            exit_code = 5
 
         except (ConnectionResetError, BrokenPipeError) as exc:
             log_error(f"Connection lost: {exc}")
             session.fail(str(exc))
-            sys.exit(6)
+            exit_code = 6
+
+        finally:
+            if bench_report is not None:
+                report = stats if stats is not None else {
+                    "role": "sender", "status": "failed", "exit_code": exit_code,
+                    "chunk_size_bytes": chunk_size, "peak_rss_kb": _peak_rss_kb(),
+                }
+                report.setdefault("status", "success")
+                try:
+                    bench_report.parent.mkdir(parents=True, exist_ok=True)
+                    with open(bench_report, "w") as f:
+                        json.dump(report, f, indent=2)
+                except OSError as exc:
+                    log_error(f"Failed to write bench report to {bench_report}: {exc}")
+
+        if exit_code != 0:
+            sys.exit(exit_code)
 
     except OSError as exc:
         log_error(f"Could not bind to {host}:{port} — {exc}")
@@ -425,6 +487,29 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Key name prefix (e.g. 'alice' → keys/alice_private.pem).",
     )
     parser.add_argument(
+        "--chunk-size",
+        type=int,
+        default=DEFAULT_CHUNK_SIZE,
+        metavar="BYTES",
+        help=(
+            f"Plaintext bytes per chunk before encryption. Default: "
+            f"{DEFAULT_CHUNK_SIZE} (64 KB). Must be a multiple of 16 "
+            "(AES-CBC block size)."
+        ),
+    )
+    parser.add_argument(
+        "--bench-report",
+        type=str,
+        default=None,
+        metavar="PATH",
+        help=(
+            "Write a JSON file with per-transfer timing/memory stats "
+            "(handshake vs. bulk-transfer latency, peak RSS) to PATH after "
+            "the transfer finishes. Used by the benchmark suite; has no "
+            "effect on the transfer itself."
+        ),
+    )
+    parser.add_argument(
         "--version", "-v",
         action="version",
         version="secure-file-transfer sender v1.0.0",
@@ -439,13 +524,25 @@ def main():
     if not (1 <= args.port <= 65535):
         parser.error(f"Invalid port: {args.port}. Must be between 1 and 65535.")
 
+    if args.chunk_size <= 0 or args.chunk_size % 16 != 0:
+        parser.error(
+            f"Invalid --chunk-size: {args.chunk_size}. Must be a positive "
+            "multiple of 16 (AES-CBC block size)."
+        )
+
     try:
         load_private_key(args.key)
         log_info(f"Sender private key loaded: '{args.key}'")
     except Exception as exc:
         parser.error(f"Failed to load private key '{args.key}': {exc}")
 
-    run_server(Path(args.file).resolve(), args.host, args.port)
+    run_server(
+        Path(args.file).resolve(),
+        args.host,
+        args.port,
+        chunk_size=args.chunk_size,
+        bench_report=Path(args.bench_report) if args.bench_report else None,
+    )
 
 
 if __name__ == "__main__":
