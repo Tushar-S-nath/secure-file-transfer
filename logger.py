@@ -168,15 +168,20 @@ class TransferSession:
             "error"             : self.error,
         }
 
+        # JSON Lines format: one record appended per write, no read-modify-
+        # write cycle needed. This is what actually fixes the corruption --
+        # the old approach (read the whole array, append, rewrite the whole
+        # file) had a real race condition: if two transfers finished at
+        # close enough times, one process's rewrite could land while
+        # another's write was still in flight, silently corrupting the
+        # file into two concatenated JSON arrays (which is exactly what a
+        # "Extra data" JSONDecodeError means). Appending a single line is
+        # far more robust under concurrent writes than reading, modifying,
+        # and rewriting an entire shared file.
         try:
-            history = []
-            if os.path.exists(JSON_LOG_FILE):
-                with open(JSON_LOG_FILE, "r", encoding="utf-8") as f:
-                    history = json.load(f)
-            history.append(record)
-            with open(JSON_LOG_FILE, "w", encoding="utf-8") as f:
-                json.dump(history, f, indent=2)
-        except (OSError, json.JSONDecodeError) as e:
+            with open(JSON_LOG_FILE, "a", encoding="utf-8") as f:
+                f.write(json.dumps(record) + "\n")
+        except OSError as e:
             log.warning(f"Failed to write JSON log record: {e}")
 
 
@@ -190,17 +195,38 @@ def log_warning(msg: str) -> None: log.warning(msg)
 def log_error(msg: str)   -> None: log.error(msg)
 
 
-def print_transfer_history() -> None:
-    """Print all past transfer sessions from the JSON log in a clean table."""
-    if not os.path.exists(JSON_LOG_FILE):
-        print("[!] No transfer history found.")
-        return
+def _read_history() -> list:
+    """
+    Read all transfer records from the JSON Lines log.
 
+    Skips any individual line that fails to parse (e.g. a leftover
+    corrupted line from before this format was adopted, or a write that
+    was interrupted mid-line) rather than failing the entire read --
+    one bad line no longer takes out the whole history.
+    """
+    history = []
+    if not os.path.exists(JSON_LOG_FILE):
+        return history
     try:
         with open(JSON_LOG_FILE, "r", encoding="utf-8") as f:
-            history = json.load(f)
-    except (OSError, json.JSONDecodeError):
-        print("[!] Could not read transfer history.")
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    history.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue  # skip this one corrupted line, keep going
+    except OSError:
+        pass
+    return history
+
+
+def print_transfer_history() -> None:
+    """Print all past transfer sessions from the JSON log in a clean table."""
+    history = _read_history()
+    if not history:
+        print("[!] No transfer history found.")
         return
 
     print()
