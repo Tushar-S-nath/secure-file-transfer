@@ -34,3 +34,5 @@ _imp_*
 
 # padding_oracle_exploit.py artifacts — regenerated fresh each run
 _poc_gcm_*
+keys/*.pem
+!keys/.gitkeep
