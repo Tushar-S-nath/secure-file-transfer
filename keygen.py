@@ -251,26 +251,42 @@ def parse_args():
 def main():
     args = parse_args()
 
-    # Guard: check if keys already exist
-    private_path = os.path.join(KEYS_DIR, f"{args.name}_private.pem")
-    if os.path.exists(private_path) and not args.overwrite:
-        print(f"[!] Keys with name '{args.name}' already exist.")
+    # RSA and ML-KEM existence are checked INDEPENDENTLY -- this matters
+    # for an identity that already has RSA keys from before --post-quantum
+    # existed: running `keygen.py --name alice --post-quantum` on such an
+    # identity should generate the MISSING ML-KEM keys without touching
+    # (or needing --overwrite for) the RSA keys that already work fine.
+    rsa_private_path = os.path.join(KEYS_DIR, f"{args.name}_private.pem")
+    rsa_exists = os.path.exists(rsa_private_path)
+
+    mlkem_private_path = os.path.join(KEYS_DIR, f"{args.name}_mlkem_private.bin")
+    mlkem_exists = os.path.exists(mlkem_private_path)
+
+    need_rsa   = (not rsa_exists) or args.overwrite
+    need_mlkem = args.post_quantum and ((not mlkem_exists) or args.overwrite)
+
+    if not need_rsa and not need_mlkem:
+        print(f"[!] Keys with name '{args.name}' already exist"
+              f"{' (including ML-KEM)' if args.post_quantum else ''}.")
         print(f"    Use --overwrite to regenerate them.")
         return
 
     try:
-        key = generate_rsa_keypair(key_size=args.bits)
-        save_keypair(key, name=args.name)
-        print_key_info(key, name=args.name)
+        if need_rsa:
+            key = generate_rsa_keypair(key_size=args.bits)
+            save_keypair(key, name=args.name)
+            print_key_info(key, name=args.name)
+        else:
+            print(f"[i] RSA keys for '{args.name}' already exist — keeping them "
+                  f"(use --overwrite to regenerate).")
 
         if args.post_quantum:
-            mlkem_private_path = os.path.join(KEYS_DIR, f"{args.name}_mlkem_private.bin")
-            if os.path.exists(mlkem_private_path) and not args.overwrite:
-                print(f"[!] ML-KEM keys with name '{args.name}' already exist.")
-                print(f"    Use --overwrite to regenerate them.")
-            else:
+            if need_mlkem:
                 mlkem_key = generate_mlkem_keypair()
                 save_mlkem_keypair(mlkem_key, name=args.name)
+            else:
+                print(f"[i] ML-KEM keys for '{args.name}' already exist — keeping them "
+                      f"(use --overwrite to regenerate).")
 
         print(f"[✓] Phase 1 complete. Keys ready for use.\n")
 
