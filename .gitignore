@@ -36,3 +36,4 @@ _imp_*
 _poc_gcm_*
 keys/*.pem
 !keys/.gitkeep
+keys/*.bin
