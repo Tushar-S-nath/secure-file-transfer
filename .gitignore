@@ -26,3 +26,8 @@ replay_demo_test_file.bin
 replay_demo_output/
 replay_demo_sender.log
 replay_demo_receiver.log
+
+# attack_resistance_*.py artifacts — regenerated fresh each run
+_por_*
+_tamper_*
+_imp_*
