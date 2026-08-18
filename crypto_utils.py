@@ -18,6 +18,7 @@ from typing import Generator, Tuple
 from Crypto.PublicKey  import RSA
 from Crypto.Cipher     import AES, PKCS1_OAEP
 from Crypto.Hash       import SHA256
+from Crypto.Protocol.KDF import HKDF
 from Crypto.Random     import get_random_bytes
 from Crypto.Util.Padding import pad, unpad
 from Crypto.Signature  import pss
@@ -256,6 +257,67 @@ def verify_peer_identity(claimed_name: str, presented_public_key_pem: bytes,
         )
 
     return trusted_key
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECTION 1C — Hybrid Post-Quantum Key Exchange (RSA + ML-KEM)
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# RSA's security rests on integer factorization being hard for classical
+# computers -- but a sufficiently capable quantum computer could break it
+# (Shor's algorithm). This isn't an immediate threat (no such computer
+# exists yet), but it enables a real attack pattern called "harvest now,
+# decrypt later": an adversary records encrypted traffic today and simply
+# waits for quantum computers to mature enough to decrypt it retroactively.
+#
+# ML-KEM (NIST FIPS 203, finalized August 2024) is a key-encapsulation
+# mechanism believed to resist attacks from both classical AND quantum
+# computers, based on a different, lattice-based hard problem.
+#
+# Rather than replacing RSA with ML-KEM outright, SFTP-Hybrid combines
+# BOTH: the sender generates a secret via RSA-OAEP encryption (as before)
+# AND a separate secret via ML-KEM encapsulation, then derives the actual
+# session key from both combined. This is deliberate "belt and suspenders"
+# design (the same approach Chrome and Signal use for post-quantum
+# migration): an attacker must break BOTH RSA AND ML-KEM to recover the
+# session key -- breaking either one alone yields nothing usable.
+
+HYBRID_KDF_SALT = b"SFTP-Hybrid-PQ-KDF-v1"   # fixed, public salt — HKDF salts
+                                              # don't need to be secret, just
+                                              # domain-separated from other
+                                              # uses of HKDF in this codebase
+
+
+def derive_hybrid_session_key(rsa_secret: bytes, mlkem_secret: bytes,
+                               key_length: int = AES_KEY_SIZE) -> bytes:
+    """
+    Combine an RSA-derived secret and an ML-KEM-derived shared secret into
+    a single session key via HKDF (RFC 5869).
+
+    This is the actual hybrid security property: the output depends on
+    BOTH inputs. An attacker who somehow recovers rsa_secret (e.g. RSA is
+    broken by a future quantum computer) still cannot compute the real
+    session key without ALSO knowing mlkem_secret, and vice versa.
+
+    Args:
+        rsa_secret    : secret recovered via RSA-OAEP (see rsa_encrypt/rsa_decrypt)
+        mlkem_secret  : shared secret from ML-KEM encapsulate()/decapsulate()
+        key_length    : output key length in bytes (defaults to AES-256's 32)
+
+    Returns:
+        key_length bytes of derived key material
+    """
+    try:
+        combined_input_material = rsa_secret + mlkem_secret
+        return HKDF(
+            master=combined_input_material,
+            key_len=key_length,
+            salt=HYBRID_KDF_SALT,
+            hashmod=SHA256,
+            num_keys=1,
+        )
+    except (ValueError, TypeError) as e:
+        raise EncryptionError("Hybrid key derivation failed.", details=str(e))
 
 
 def bundle_keys(aes_key: bytes, hmac_key: bytes) -> bytes:

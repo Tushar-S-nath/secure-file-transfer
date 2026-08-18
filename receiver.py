@@ -53,6 +53,7 @@ try:
         verify_peer_identity,
         verify_signature,
         generate_challenge_nonce,
+        derive_hybrid_session_key,
     )
     from protocol import (
         send_packet,
@@ -261,6 +262,9 @@ def perform_transfer(
     session: TransferSession,
     peer_name: str = None,
     own_name: str = None,
+    post_quantum: bool = False,
+    own_mlkem_private_key=None,
+    own_mlkem_public_key_bytes: bytes = None,
 ) -> tuple:
     """
     Execute the full handshake + file reception over an established socket.
@@ -280,6 +284,17 @@ def perform_transfer(
                         handshake — unchanged behavior for existing callers.
         own_name:       This receiver's own identity name (required if
                         peer_name is set — sent in the named HELLO).
+        post_quantum:   If True, ALSO includes our ML-KEM-768 public key
+                        in the named HELLO, and decapsulates the ML-KEM
+                        ciphertext the sender sends back, combining that
+                        secret with the RSA secret via HKDF (see
+                        crypto_utils.derive_hybrid_session_key) — see
+                        sender.py's perform_transfer docstring for the
+                        full rationale. Requires peer_name.
+        own_mlkem_private_key:      This receiver's ML-KEM private key
+                                    object (required if post_quantum).
+        own_mlkem_public_key_bytes: This receiver's ML-KEM public key,
+                                    raw bytes (required if post_quantum).
 
     Returns:
         (output_path, stats) where stats is a dict of wall-clock timings
@@ -289,6 +304,10 @@ def perform_transfer(
     """
     if peer_name is not None and own_name is None:
         raise ValueError("peer_name requires own_name (mutual auth needs it for our own HELLO).")
+    if post_quantum and peer_name is None:
+        raise ValueError("post_quantum requires peer_name (mutual auth) to also be enabled.")
+    if post_quantum and (own_mlkem_private_key is None or own_mlkem_public_key_bytes is None):
+        raise ValueError("post_quantum requires own_mlkem_private_key and own_mlkem_public_key_bytes.")
 
     t_start = time.perf_counter()
 
@@ -303,9 +322,16 @@ def perform_transfer(
         # signature was computed over a DIFFERENT (old) nonce, so it
         # won't match what we verify against here.
         challenge_nonce = generate_challenge_nonce()
-        log_info(f"Sending named HELLO as '{own_name}' (mutual auth, expecting sender '{peer_name}')…")
+        log_info(f"Sending named HELLO as '{own_name}' (mutual auth, expecting sender '{peer_name}')"
+                 f"{', post-quantum (ML-KEM-768 + RSA)' if post_quantum else ''}…")
         try:
-            send_packet(conn, PacketType.HELLO, build_hello_named(public_key_pem, own_name, challenge_nonce))
+            send_packet(
+                conn, PacketType.HELLO,
+                build_hello_named(
+                    public_key_pem, own_name, challenge_nonce,
+                    mlkem_public_key=own_mlkem_public_key_bytes if post_quantum else None,
+                )
+            )
             ptype, kx_payload = recv_packet(conn)
         except Exception as exc:
             raise HandshakeError(f"Handshake failed: {exc}") from exc
@@ -342,12 +368,21 @@ def perform_transfer(
         from Crypto.PublicKey import RSA as _RSA
         sender_trusted_pubkey = _RSA.import_key(sender_trusted_pubkey_pem)
 
-        # Verifying over (encrypted_bundle + challenge_nonce), NOT just
-        # encrypted_bundle, is the actual replay-protection check: a
-        # signature captured from a past session was computed over that
-        # past session's (different) nonce and will fail here.
+        if post_quantum and not kx["mlkem_ciphertext"]:
+            raise HandshakeError(
+                "post_quantum requested but the sender's KEY_EXCHANGE did "
+                "not include an ML-KEM ciphertext — is the sender also "
+                "using --post-quantum?"
+            )
+
+        # Verifying over (encrypted_bundle + challenge_nonce [+ mlkem_ciphertext]),
+        # NOT just encrypted_bundle, is the actual replay-protection check
+        # (a signature captured from a past session was computed over that
+        # past session's different nonce, and will fail here) — extended to
+        # also bind the ML-KEM ciphertext so it can't be swapped in transit.
+        signature_input = kx["encrypted_bundle"] + challenge_nonce + (kx["mlkem_ciphertext"] or b"")
         try:
-            verify_signature(sender_trusted_pubkey, kx["encrypted_bundle"] + challenge_nonce, kx["signature"])
+            verify_signature(sender_trusted_pubkey, signature_input, kx["signature"])
         except AuthenticationError as exc:
             raise AuthenticationError(
                 "Signature verification failed — this may be a replayed "
@@ -356,6 +391,14 @@ def perform_transfer(
                 details=str(exc)
             ) from exc
         log_info(f"✓ Sender identity verified: '{peer_name}' (fresh session, not a replay)")
+
+        mlkem_secret = None
+        if post_quantum:
+            try:
+                mlkem_secret = own_mlkem_private_key.decapsulate(kx["mlkem_ciphertext"])
+                log_info("✓ ML-KEM-768 decapsulation complete (post-quantum secret recovered)")
+            except Exception as exc:
+                raise HandshakeError(f"ML-KEM decapsulation failed: {exc}") from exc
 
         encrypted_bundle = kx["encrypted_bundle"]
 
@@ -409,18 +452,38 @@ def perform_transfer(
         f"{cipher_mode})"
     )
 
-    # Now that cipher_mode is known, unbundle the RSA-decrypted key material
-    # with the matching format.
+    # Now that cipher_mode is known, derive/unbundle the actual session
+    # key material. Post-quantum mode combines the RSA secret (raw_bundle,
+    # which in PQ mode is just the 32-byte RSA-decrypted secret, not a
+    # further-bundled structure) with the ML-KEM secret via HKDF; classical
+    # mode uses the original unbundle_keys_gcm/unbundle_keys functions,
+    # unchanged.
     try:
-        if cipher_mode == "AES-256-GCM":
-            aes_key    = unbundle_keys_gcm(raw_bundle)
-            base_nonce = header["nonce"]
+        if post_quantum:
+            if cipher_mode == "AES-256-GCM":
+                needed_bytes = 32 + 8    # aes_key + base_nonce
+            else:
+                needed_bytes = 32 + 16 + 32   # aes_key + iv + hmac_key
+            combined = derive_hybrid_session_key(raw_bundle, mlkem_secret, key_length=needed_bytes)
+
+            if cipher_mode == "AES-256-GCM":
+                aes_key    = combined[:32]
+                base_nonce = combined[32:40]
+            else:
+                aes_key     = combined[:32]
+                iv          = combined[32:48]
+                hmac_key    = combined[48:80]
+                hmac_digest = header["hmac"]   # transmitted value to check against — not derived
         else:
-            aes_key, hmac_key = unbundle_keys(raw_bundle)
-            iv          = header["iv"]     # bytes (parse_file_header decodes hex → bytes)
-            hmac_digest = header["hmac"]   # bytes — key is "hmac", not "hmac_digest"
+            if cipher_mode == "AES-256-GCM":
+                aes_key    = unbundle_keys_gcm(raw_bundle)
+                base_nonce = header["nonce"]
+            else:
+                aes_key, hmac_key = unbundle_keys(raw_bundle)
+                iv          = header["iv"]     # bytes (parse_file_header decodes hex → bytes)
+                hmac_digest = header["hmac"]   # bytes — key is "hmac", not "hmac_digest"
     except Exception as exc:
-        raise HandshakeError(f"Failed to unbundle keys for {cipher_mode}: {exc}") from exc
+        raise HandshakeError(f"Failed to unbundle/derive keys for {cipher_mode}: {exc}") from exc
 
     # ── Steps 3-4: Receive FILE_CHUNK packets, decrypting each AS IT ARRIVES ─
     # Still within the bulk_transfer_seconds window started at Step 2. Real
@@ -575,6 +638,7 @@ def run_client(
     output_dir: Path,
     bench_report: Optional[Path] = None,
     peer_name: str = None,
+    post_quantum: bool = False,
 ):
     """Connect to the sender and run the full secure file reception flow.
 
@@ -586,6 +650,10 @@ def run_client(
         peer_name: if given, enables mutual authentication — see
             perform_transfer's docstring. Requires the sender to also
             use --peer.
+        post_quantum: hybrid RSA + ML-KEM key exchange — see
+            perform_transfer's docstring. Requires peer_name, and requires
+            key_name's identity to have an ML-KEM keypair on file
+            (keygen.py --post-quantum).
     """
 
     print("=" * 60)
@@ -605,6 +673,19 @@ def run_client(
     except Exception as exc:
         log_error(f"Failed to load keys '{key_name}': {exc}")
         sys.exit(1)
+
+    own_mlkem_private_key = None
+    own_mlkem_public_key_bytes = None
+    if post_quantum:
+        try:
+            from keygen import load_mlkem_private_key, load_mlkem_public_key
+            own_mlkem_private_key = load_mlkem_private_key(key_name)
+            own_mlkem_public_key_bytes = load_mlkem_public_key(key_name).public_bytes_raw()
+            log_info(f"ML-KEM-768 key pair loaded: '{key_name}'")
+        except Exception as exc:
+            log_error(f"Failed to load ML-KEM keys '{key_name}': {exc}")
+            log_error(f"Run: python keygen.py --name {key_name} --post-quantum")
+            sys.exit(1)
 
     log_info(f"Connecting to sender at {host}:{port}…")
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -643,6 +724,9 @@ def run_client(
             output_path, stats = perform_transfer(
                 sock, private_key, public_key_pem, output_dir, session,
                 peer_name=peer_name, own_name=key_name if peer_name else None,
+                post_quantum=post_quantum,
+                own_mlkem_private_key=own_mlkem_private_key,
+                own_mlkem_public_key_bytes=own_mlkem_public_key_bytes,
             )
 
             print(f"\n  ✓ Transfer complete → {output_path}")
@@ -765,6 +849,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--post-quantum", "--pq",
+        action="store_true",
+        help=(
+            "Combine an ML-KEM-768 encapsulated secret with the RSA secret "
+            "(via HKDF) so the session key resists a future quantum attack "
+            "on RSA. Requires --peer, and requires --key's identity to have "
+            "an ML-KEM keypair (keygen.py --post-quantum). Requires the "
+            "sender to also use --post-quantum."
+        ),
+    )
+    parser.add_argument(
         "--version", "-v",
         action="version",
         version="secure-file-transfer receiver v1.0.0",
@@ -779,6 +874,9 @@ def main():
     if not (1 <= args.port <= 65535):
         parser.error(f"Invalid port: {args.port}. Must be between 1 and 65535.")
 
+    if args.post_quantum and not args.peer:
+        parser.error("--post-quantum requires --peer (mutual authentication) to also be set.")
+
     run_client(
         host         = args.host,
         port         = args.port,
@@ -786,6 +884,7 @@ def main():
         output_dir   = Path(args.output),
         bench_report = Path(args.bench_report) if args.bench_report else None,
         peer_name    = args.peer,
+        post_quantum = args.post_quantum,
     )
 
 

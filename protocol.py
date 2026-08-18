@@ -209,23 +209,31 @@ def parse_key_exchange(payload: bytes) -> bytes:
 # "Identity: Fingerprinting and RSA Signatures" section for the
 # verification side.
 
-def build_hello_named(public_key_pem: bytes, name: str, challenge_nonce: bytes) -> bytes:
+def build_hello_named(public_key_pem: bytes, name: str, challenge_nonce: bytes,
+                       mlkem_public_key: bytes = None) -> bytes:
     """
-    Named HELLO payload for mutual authentication + replay protection.
-    Carries the sender's public key, their claimed identity name (so
-    the receiving side can verify the presented key against a locally
-    trusted copy — crypto_utils.verify_peer_identity), AND a fresh
-    challenge_nonce generated for THIS connection attempt only.
+    Named HELLO payload for mutual authentication + replay protection,
+    optionally also carrying an ML-KEM public key for post-quantum
+    hybrid key exchange (see crypto_utils.derive_hybrid_session_key).
 
-    The other side must bind challenge_nonce into its signed
-    key-exchange bundle (see crypto_utils.generate_challenge_nonce for
-    why this prevents replaying a captured old session).
+    Carries the sender's RSA public key, their claimed identity name (so
+    the receiving side can verify the presented key against a locally
+    trusted copy — crypto_utils.verify_peer_identity), a fresh
+    challenge_nonce generated for THIS connection attempt only, and —
+    if post-quantum mode is enabled — the sender's ML-KEM public key.
+
+    Args:
+        mlkem_public_key: 1184-byte ML-KEM-768 public key, or None to
+                           keep the classical-only (RSA + mutual auth)
+                           behavior unchanged.
     """
     payload = {
         "name": name,
         "public_key": public_key_pem.decode("utf-8"),
         "challenge_nonce": challenge_nonce.hex(),
     }
+    if mlkem_public_key is not None:
+        payload["mlkem_public_key"] = mlkem_public_key.hex()
     return json.dumps(payload).encode("utf-8")
 
 
@@ -234,7 +242,8 @@ def parse_hello_named(payload: bytes) -> dict:
     Parse a named HELLO payload (see build_hello_named).
 
     Returns:
-        {"name": str, "public_key": bytes, "challenge_nonce": bytes}
+        {"name": str, "public_key": bytes, "challenge_nonce": bytes,
+         "mlkem_public_key": bytes or None}
     """
     try:
         obj = json.loads(payload.decode("utf-8"))
@@ -245,31 +254,48 @@ def parse_hello_named(payload: bytes) -> dict:
             raise ValueError("public_key field is not a valid PEM key")
         if len(challenge_nonce) < 16:
             raise ValueError("challenge_nonce too short — expected 16 bytes")
-        return {"name": name, "public_key": public_key_pem, "challenge_nonce": challenge_nonce}
+
+        mlkem_public_key = None
+        if obj.get("mlkem_public_key"):
+            mlkem_public_key = bytes.fromhex(obj["mlkem_public_key"])
+
+        return {
+            "name": name,
+            "public_key": public_key_pem,
+            "challenge_nonce": challenge_nonce,
+            "mlkem_public_key": mlkem_public_key,
+        }
     except (json.JSONDecodeError, KeyError, ValueError, UnicodeDecodeError) as e:
         raise HandshakeError("Invalid named HELLO payload.", details=str(e))
 
 
-def build_key_exchange_signed(encrypted_bundle: bytes, sender_name: str, signature: bytes) -> bytes:
+def build_key_exchange_signed(encrypted_bundle: bytes, sender_name: str, signature: bytes,
+                               mlkem_ciphertext: bytes = None) -> bytes:
     """
     KEY_EXCHANGE payload carrying a signature that proves the sender's
-    identity, for mutual authentication. The sender signs
-    `encrypted_bundle` with its OWN private key
-    (crypto_utils.sign_data); the receiver verifies that signature
-    against the LOCALLY trusted public key for `sender_name` — the
-    sender's public key itself is never transmitted here, deliberately,
+    identity, for mutual authentication, optionally also carrying an
+    ML-KEM ciphertext for post-quantum hybrid key exchange.
+
+    The sender signs (encrypted_bundle + challenge_nonce [+ mlkem_ciphertext
+    if present]) with its OWN private key (crypto_utils.sign_data) — see
+    sender.py/receiver.py for the exact bytes signed; the receiver verifies
+    that signature against the LOCALLY trusted public key for `sender_name`.
+    The sender's public key itself is never transmitted here, deliberately,
     so the receiver can only ever trust a key it already had on file.
 
-    Wire format (binary, not JSON — encrypted_bundle and signature are
-    both raw high-entropy bytes, which don't round-trip cleanly through
-    JSON without base64 overhead):
+    Wire format (binary, not JSON — these are all raw high-entropy bytes,
+    which don't round-trip cleanly through JSON without base64 overhead):
         [4-byte name length][name utf-8]
         [4-byte signature length][signature]
+        [4-byte mlkem_ciphertext length][mlkem_ciphertext, possibly empty]
         [encrypted_bundle — remainder of payload]
     """
     name_bytes = sender_name.encode("utf-8")
+    mlkem_ciphertext_bytes = mlkem_ciphertext if mlkem_ciphertext is not None else b""
+
     out  = struct.pack(">I", len(name_bytes)) + name_bytes
     out += struct.pack(">I", len(signature)) + signature
+    out += struct.pack(">I", len(mlkem_ciphertext_bytes)) + mlkem_ciphertext_bytes
     out += encrypted_bundle
     return out
 
@@ -279,7 +305,8 @@ def parse_key_exchange_signed(payload: bytes) -> dict:
     Parse a signed KEY_EXCHANGE payload (see build_key_exchange_signed).
 
     Returns:
-        {"sender_name": str, "signature": bytes, "encrypted_bundle": bytes}
+        {"sender_name": str, "signature": bytes, "mlkem_ciphertext": bytes or None,
+         "encrypted_bundle": bytes}
     """
     try:
         offset = 0
@@ -293,13 +320,19 @@ def parse_key_exchange_signed(payload: bytes) -> dict:
         signature = payload[offset:offset + sig_len]
         offset += sig_len
 
+        mlkem_ct_len = struct.unpack(">I", payload[offset:offset + 4])[0]
+        offset += 4
+        mlkem_ciphertext = payload[offset:offset + mlkem_ct_len] if mlkem_ct_len > 0 else None
+        offset += mlkem_ct_len
+
         encrypted_bundle = payload[offset:]
         if not sender_name or not signature or not encrypted_bundle:
-            raise ValueError("One or more fields empty in signed KEY_EXCHANGE payload")
+            raise ValueError("One or more required fields empty in signed KEY_EXCHANGE payload")
 
         return {
             "sender_name": sender_name,
             "signature": signature,
+            "mlkem_ciphertext": mlkem_ciphertext,
             "encrypted_bundle": encrypted_bundle,
         }
     except (struct.error, UnicodeDecodeError, IndexError, ValueError) as e:

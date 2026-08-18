@@ -57,7 +57,9 @@ try:
         verify_peer_identity,
         sign_data,
         compute_key_fingerprint,
+        derive_hybrid_session_key,
     )
+    from Crypto.Random import get_random_bytes
     from protocol import (
         send_packet,
         recv_packet,
@@ -160,6 +162,7 @@ def perform_transfer(
     peer_name: str = None,
     own_name: str = None,
     own_private_key=None,
+    post_quantum: bool = False,
 ) -> dict:
     """
     Execute the full handshake + file transfer over an established socket.
@@ -189,6 +192,17 @@ def perform_transfer(
                           peer_name is set — used in the signature).
         own_private_key: This sender's own RSA private key object
                           (required if peer_name is set — used to sign).
+        post_quantum:    If True, ALSO combines an ML-KEM-768 encapsulated
+                          secret with the RSA secret via HKDF (see
+                          crypto_utils.derive_hybrid_session_key), so the
+                          session key resists a future quantum attack on
+                          RSA. Requires peer_name to be set — post-quantum
+                          mode reuses the same named-HELLO/signed-KEY_EXCHANGE
+                          wire format mutual auth already needs, rather than
+                          adding yet another separate handshake variant.
+                          Requires the receiver to also have generated an
+                          ML-KEM keypair (keygen.py --post-quantum) and to
+                          also pass post_quantum=True.
 
     Returns:
         A stats dict with wall-clock timings (handshake_seconds,
@@ -201,6 +215,8 @@ def perform_transfer(
         raise ValueError(f"Unknown cipher_mode: {cipher_mode!r}")
     if peer_name is not None and (own_name is None or own_private_key is None):
         raise ValueError("peer_name requires own_name and own_private_key (mutual auth needs both to sign).")
+    if post_quantum and peer_name is None:
+        raise ValueError("post_quantum requires peer_name (mutual auth) to also be enabled — see docstring.")
 
     filename = file_path.name
     file_size = file_path.stat().st_size
@@ -245,32 +261,73 @@ def perform_transfer(
         log_info(f"✓ Receiver identity verified: '{peer_name}' "
                  f"(fingerprint {compute_key_fingerprint(receiver_pubkey)[:16]}…)")
 
-        if cipher_mode == "AES-256-GCM":
-            aes_key, base_nonce = generate_session_key_gcm()
-            session_keys["aes_key"]    = aes_key
-            session_keys["base_nonce"] = base_nonce
-            bundle = bundle_keys_gcm(aes_key)
-        else:
-            aes_key, iv = generate_session_key()
-            hmac_key    = generate_hmac_key()
-            session_keys["aes_key"]  = aes_key
-            session_keys["iv"]       = iv
-            session_keys["hmac_key"] = hmac_key
-            bundle = bundle_keys(aes_key, hmac_key)
+        if post_quantum:
+            if hello["mlkem_public_key"] is None:
+                raise HandshakeError(
+                    "Post-quantum mode requested (--post-quantum) but the "
+                    "receiver's HELLO did not include an ML-KEM public key "
+                    "— is the receiver also using --post-quantum?"
+                )
+            from cryptography.hazmat.primitives.asymmetric import mlkem as _mlkem
+            receiver_mlkem_pubkey = _mlkem.MLKEM768PublicKey.from_public_bytes(hello["mlkem_public_key"])
+            mlkem_secret, mlkem_ciphertext = receiver_mlkem_pubkey.encapsulate()
+            log_info("✓ ML-KEM-768 encapsulation complete (post-quantum secret established)")
 
-        encrypted_bundle = rsa_encrypt(receiver_pubkey, bundle)
-        # Sign (encrypted_bundle + challenge_nonce), NOT just
-        # encrypted_bundle — this is the sender's half of replay
-        # protection. The nonce came from THIS receiver's THIS HELLO, so
-        # our signature can never be validly replayed against a future
-        # connection (which will present a different, fresh nonce).
-        signature = sign_data(own_private_key, encrypted_bundle + hello["challenge_nonce"])
-        log_info(f"✓ Key-exchange bundle signed as '{own_name}' (bound to this session's challenge)")
+            # A fresh random secret, RSA-OAEP encrypted — this is the
+            # "classical" half of the hybrid. Note this is a raw secret
+            # fed into the KDF below, not the AES key itself directly
+            # (unlike the non-PQ path, which encrypts the AES key/bundle
+            # straight up).
+            rsa_secret = get_random_bytes(32)
+            encrypted_bundle = rsa_encrypt(receiver_pubkey, rsa_secret)
+
+            # How many bytes of key material this cipher_mode needs.
+            if cipher_mode == "AES-256-GCM":
+                needed_bytes = 32 + 8    # aes_key + base_nonce
+            else:
+                needed_bytes = 32 + 16 + 32   # aes_key + iv + hmac_key
+
+            combined = derive_hybrid_session_key(rsa_secret, mlkem_secret, key_length=needed_bytes)
+
+            if cipher_mode == "AES-256-GCM":
+                session_keys["aes_key"]    = combined[:32]
+                session_keys["base_nonce"] = combined[32:40]
+            else:
+                session_keys["aes_key"]  = combined[:32]
+                session_keys["iv"]       = combined[32:48]
+                session_keys["hmac_key"] = combined[48:80]
+        else:
+            mlkem_ciphertext = None
+            if cipher_mode == "AES-256-GCM":
+                aes_key, base_nonce = generate_session_key_gcm()
+                session_keys["aes_key"]    = aes_key
+                session_keys["base_nonce"] = base_nonce
+                bundle = bundle_keys_gcm(aes_key)
+            else:
+                aes_key, iv = generate_session_key()
+                hmac_key    = generate_hmac_key()
+                session_keys["aes_key"]  = aes_key
+                session_keys["iv"]       = iv
+                session_keys["hmac_key"] = hmac_key
+                bundle = bundle_keys(aes_key, hmac_key)
+            encrypted_bundle = rsa_encrypt(receiver_pubkey, bundle)
+
+        # Sign (encrypted_bundle + challenge_nonce + mlkem_ciphertext), NOT
+        # just encrypted_bundle — this is the sender's half of replay
+        # protection, extended to also bind the ML-KEM ciphertext (so it
+        # can't be swapped in transit without invalidating the signature).
+        # The nonce came from THIS receiver's THIS HELLO, so our signature
+        # can never be validly replayed against a future connection (which
+        # will present a different, fresh nonce).
+        signature_input = encrypted_bundle + hello["challenge_nonce"] + (mlkem_ciphertext or b"")
+        signature = sign_data(own_private_key, signature_input)
+        log_info(f"✓ Key-exchange bundle signed as '{own_name}' (bound to this session's challenge"
+                 f"{', includes ML-KEM ciphertext' if post_quantum else ''})")
 
         try:
             send_packet(
                 conn, PacketType.KEY_EXCHANGE,
-                build_key_exchange_signed(encrypted_bundle, own_name, signature)
+                build_key_exchange_signed(encrypted_bundle, own_name, signature, mlkem_ciphertext=mlkem_ciphertext)
             )
         except Exception as exc:
             raise HandshakeError(f"Failed to send signed KEY_EXCHANGE: {exc}") from exc
@@ -460,6 +517,7 @@ def run_server(
     peer_name: str = None,
     own_name: str = None,
     own_private_key=None,
+    post_quantum: bool = False,
 ):
     """
     Start the TCP server, accept one receiver, run the full transfer, shut down.
@@ -474,6 +532,8 @@ def run_server(
         cipher_mode:   "AES-256-GCM" (default) or "AES-256-CBC".
         peer_name, own_name, own_private_key: mutual authentication —
             see perform_transfer's docstring.
+        post_quantum: hybrid RSA + ML-KEM key exchange — see
+            perform_transfer's docstring. Requires peer_name.
     """
     if not file_path.exists():
         log_error(f"File not found: {file_path}")
@@ -522,6 +582,7 @@ def run_server(
                 stats = perform_transfer(
                     conn, file_path, session, chunk_size=chunk_size, cipher_mode=cipher_mode,
                     peer_name=peer_name, own_name=own_name, own_private_key=own_private_key,
+                    post_quantum=post_quantum,
                 )
                 print(f"\n  ✓ Transfer complete.")
 
@@ -660,6 +721,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--post-quantum", "--pq",
+        action="store_true",
+        help=(
+            "Combine an ML-KEM-768 encapsulated secret with the RSA secret "
+            "(via HKDF) so the session key resists a future quantum attack "
+            "on RSA. Requires --peer, and requires --key's identity to have "
+            "an ML-KEM keypair (keygen.py --post-quantum). Requires the "
+            "receiver to also use --post-quantum."
+        ),
+    )
+    parser.add_argument(
         "--bench-report",
         type=str,
         default=None,
@@ -698,8 +770,12 @@ def main():
     except Exception as exc:
         parser.error(f"Failed to load private key '{args.key}': {exc}")
 
+    if args.post_quantum and not args.peer:
+        parser.error("--post-quantum requires --peer (mutual authentication) to also be set.")
+
     if args.peer:
-        log_info(f"Mutual authentication enabled — expecting receiver '{args.peer}', signing as '{args.key}'")
+        log_info(f"Mutual authentication enabled — expecting receiver '{args.peer}', signing as '{args.key}'"
+                  + (" [post-quantum: ML-KEM-768 + RSA hybrid]" if args.post_quantum else ""))
 
     run_server(
         Path(args.file).resolve(),
@@ -711,6 +787,7 @@ def main():
         peer_name=args.peer,
         own_name=args.key if args.peer else None,
         own_private_key=own_private_key if args.peer else None,
+        post_quantum=args.post_quantum,
     )
 
 
