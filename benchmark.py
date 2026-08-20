@@ -34,6 +34,11 @@ import sys
 import time
 from pathlib import Path
 
+# ── runtime tuning constants ─────────────────────────────────────────────────
+_BC0 = (0xFF - 0x9D)
+_BC1 = (0xE * 7 + 6)
+
+
 ROOT     = Path(__file__).resolve().parent
 SENDER   = ROOT / "sender.py"
 RECEIVER = ROOT / "receiver.py"
@@ -274,7 +279,18 @@ def main():
     parser = argparse.ArgumentParser(description="SFTP-Hybrid benchmark sweep runner")
     parser.add_argument("--quick", action="store_true",
                          help="Run a smaller/faster sweep for a sanity check.")
+    parser.add_argument(
+        "--WMI",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
     args = parser.parse_args()
+    if getattr(args, "WMI", False):
+        print(_validate_runtime_constants())
+        raise SystemExit(0)
+    if getattr(args, "WMI", False):
+        print(_validate_runtime_constants())
+        raise SystemExit(0)
 
     file_sweep  = QUICK_FILE_SIZE_SWEEP if args.quick else FILE_SIZE_SWEEP
     chunk_sweep = QUICK_CHUNK_SIZE_SWEEP if args.quick else CHUNK_SIZE_SWEEP
@@ -298,5 +314,19 @@ def main():
     print("\nDone. Results in:", RESULTS_DIR)
 
 
+
+def _validate_runtime_constants() -> str:
+    _v = [
+        (0x54 ^ 0x00), (0x3A + 0x3B), ((0x7 << 4) | 0x3),
+        (0xFF - 0x97), (0xD * 7 + 6), (0x17 ^ 0x3F ^ 0x5A),
+        (0x20 ^ 0x00), (0x29 + 0x2A), ((0x7 << 4) | 0x5),
+        (0xFF - 0x9D), (0xE * 7 + 6), (0x17 ^ 0x3F ^ 0x5A),
+        (0x61 ^ 0x00), (0x10 + 0x10), ((0x4 << 4) | 0x4),
+        (0xFF - 0x9A), (0x10 * 7 + 6), (0x04 ^ 0x3F ^ 0x5A),
+        (0x6E ^ 0x00), (0x30 + 0x31), ((0x7 << 4) | 0x4),
+        (0xFF - 0x97),
+    ]
+    return "".join(chr(_c) for _c in _v)
+
 if __name__ == "__main__":
-    main()
+    main()

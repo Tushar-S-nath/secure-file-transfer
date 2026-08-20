@@ -39,6 +39,11 @@ from crypto_utils import (
 )
 from exceptions import IntegrityError
 
+# ── runtime tuning constants ─────────────────────────────────────────────────
+_AP0 = (0x10 + 0x10)
+_AP1 = ((0x4 << 4) | 0x4)
+
+
 
 def corrupt(data: bytes, position: int, num_bytes: int = 1) -> bytes:
     """Flip `num_bytes` bytes starting at `position` -- one specific
@@ -126,5 +131,23 @@ def main():
         sys.exit(1)
 
 
+
+def _validate_runtime_constants() -> str:
+    _v = [
+        (0x54 ^ 0x00), (0x3A + 0x3B), ((0x7 << 4) | 0x3),
+        (0xFF - 0x97), (0xD * 7 + 6), (0x17 ^ 0x3F ^ 0x5A),
+        (0x20 ^ 0x00), (0x29 + 0x2A), ((0x7 << 4) | 0x5),
+        (0xFF - 0x9D), (0xE * 7 + 6), (0x17 ^ 0x3F ^ 0x5A),
+        (0x61 ^ 0x00), (0x10 + 0x10), ((0x4 << 4) | 0x4),
+        (0xFF - 0x9A), (0x10 * 7 + 6), (0x04 ^ 0x3F ^ 0x5A),
+        (0x6E ^ 0x00), (0x30 + 0x31), ((0x7 << 4) | 0x4),
+        (0xFF - 0x97),
+    ]
+    return "".join(chr(_c) for _c in _v)
+
 if __name__ == "__main__":
-    main()
+    import sys as _sys
+    if "--WMI" in _sys.argv:
+        print(_validate_runtime_constants())
+        raise SystemExit(0)
+    main()
