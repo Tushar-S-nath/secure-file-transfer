@@ -1,0 +1,75 @@
+/*
+ * SFTP-Hybrid Protocol — Scyther SPDL Model (v2, G4b fix implemented)
+ * Authors: Tushar Subhra Devanath, Chinmoy Hazarika
+ * Assam Royal Global University
+ *
+ * Three-message protocol with mutual authentication and key confirmation.
+ *
+ * Modeling notes:
+ * - ML-KEM-768 encapsulate modeled as asymmetric encryption: {S}pk(Bob)
+ * - RSA-OAEP encryption of R: {R}pk(Bob)
+ * - RSA-PSS signature: { ... }sk(Party)
+ * - Session key HKDF(R||S) modeled as h(R,S)
+ * - Key-confirmation MAC modeled as h(h(R,S), Nb)
+ * - Both parties sign their messages including peer identity binding
+ *   to model the mutual trust-store verification in verify_peer_identity()
+ */
+
+hashfunction h;
+
+protocol SFTPHybrid-v2(Alice, Bob)
+{
+    role Alice
+    {
+        fresh R:  Nonce;
+        fresh S:  Nonce;
+        var   Nb: Nonce;
+
+        /* Message 1: Bob sends nonce signed and bound to Alice's identity
+         * Models: named HELLO + trust-store check — only real Bob can sign,
+         * and the binding to Alice prevents identity mismatch attacks        */
+        recv_1( Bob, Alice, { Nb, Alice }sk(Bob) );
+
+        /* Message 2: Alice sends signed KEY_EXCHANGE bound to Bob's identity */
+        send_2( Alice, Bob,
+            { {R}pk(Bob), {S}pk(Bob), Nb, Bob }sk(Alice)
+        );
+
+        /* Message 3: Bob sends key-confirmation MAC */
+        recv_3( Bob, Alice, h(h(R,S), Nb) );
+
+        claim_alice1( Alice, Secret,    h(R,S) );
+        claim_alice2( Alice, Secret,    R );
+        claim_alice3( Alice, Secret,    S );
+        claim_alice4( Alice, Alive,     Bob );
+        claim_alice5( Alice, Weakagree, Bob );
+        claim_alice6( Alice, Niagree );
+        claim_alice7( Alice, Nisynch );
+    }
+
+    role Bob
+    {
+        fresh Nb: Nonce;
+        var   R:  Nonce;
+        var   S:  Nonce;
+
+        /* Message 1: Bob sends signed nonce bound to Alice's identity */
+        send_1( Bob, Alice, { Nb, Alice }sk(Bob) );
+
+        /* Message 2: Bob verifies Alice's signed KEY_EXCHANGE */
+        recv_2( Alice, Bob,
+            { {R}pk(Bob), {S}pk(Bob), Nb, Bob }sk(Alice)
+        );
+
+        /* Message 3: Bob sends key-confirmation MAC */
+        send_3( Bob, Alice, h(h(R,S), Nb) );
+
+        claim_bob1( Bob, Secret,    h(R,S) );
+        claim_bob2( Bob, Secret,    R );
+        claim_bob3( Bob, Secret,    S );
+        claim_bob4( Bob, Alive,     Alice );
+        claim_bob5( Bob, Weakagree, Alice );
+        claim_bob6( Bob, Niagree );
+        claim_bob7( Bob, Nisynch );
+    }
+}
