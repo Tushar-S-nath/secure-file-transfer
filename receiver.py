@@ -585,8 +585,22 @@ def perform_transfer(
     log_info(f"✓ Integrity verified.  SHA-256: {checksum}")
 
     # ── Step 6: Send ACK ────────────────────────────────────────────────────
-    send_packet(conn, PacketType.ACK, build_ack())
-    log_info("ACK sent to sender.")
+    # When mutual authentication is active (--peer), send a key-confirmation
+    # MAC instead of a plain text ACK: HMAC-SHA256(aes_key, challenge_nonce
+    # || b'sftp-hybrid-confirm').  Only a receiver that successfully derived
+    # the same session key can produce a valid MAC, giving the sender
+    # cryptographic proof that Ks is genuinely shared — closing the G4b gap
+    # identified in the BAN logic analysis.
+    # Without mutual auth there is no identity-bound challenge_nonce, so
+    # we fall back to the original plain-text ACK.
+    if peer_name is not None:
+        from protocol import build_ack_confirmation
+        ack_mac = build_ack_confirmation(aes_key, challenge_nonce)
+        send_packet(conn, PacketType.ACK, ack_mac)
+        log_info("✓ Key-confirmation ACK sent (HMAC-SHA256 over session key + nonce).")
+    else:
+        send_packet(conn, PacketType.ACK, build_ack())
+        log_info("ACK sent to sender.")
 
     # ── Step 7: Move decrypted file to final output path ────────────────────
     output_dir.mkdir(parents=True, exist_ok=True)

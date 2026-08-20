@@ -471,7 +471,25 @@ def perform_transfer(
     if ptype != PacketType.ACK:
         raise SessionError(f"Expected ACK, got {ptype}")
 
-    log_info("✓ ACK received — receiver confirmed integrity.")
+    # ── Key-confirmation verification (G4b fix) ──────────────────────────────
+    # When mutual authentication is active (--peer), the receiver sends
+    # HMAC-SHA256(aes_key, challenge_nonce || b'sftp-hybrid-confirm') as the
+    # ACK payload instead of a plain text message.  Verifying this MAC gives
+    # the sender cryptographic proof that the receiver independently derived
+    # the same session key — closing the G4b gap identified in the BAN logic
+    # analysis.  Without mutual auth there is no challenge_nonce bound to an
+    # identity, so we fall back to accepting the plain ACK as before.
+    if peer_name is not None:
+        from protocol import verify_ack_confirmation
+        if not verify_ack_confirmation(aes_key, hello["challenge_nonce"], ack_payload):
+            raise IntegrityError(
+                "[SecureTransfer Error] Key-confirmation failed — "
+                "receiver's ACK MAC does not match the expected session key. "
+                "Possible session-key mismatch or tampered ACK."
+            )
+        log_info("✓ Key-confirmation verified — receiver holds the same session key (G4b).")
+    else:
+        log_info("✓ ACK received — receiver confirmed integrity.")
 
     # Mark session complete with checksum
     session.bytes_transferred = file_size

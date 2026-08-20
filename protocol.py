@@ -444,6 +444,48 @@ def build_ack(message: str = "Transfer verified successfully.") -> bytes:
     return message.encode("utf-8")
 
 
+def build_ack_confirmation(aes_key: bytes, challenge_nonce: bytes) -> bytes:
+    """
+    Key-confirmation ACK (G4b fix).
+
+    Computes HMAC-SHA256(aes_key, challenge_nonce || b'sftp-hybrid-confirm')
+    and returns it as the ACK payload.  Only a receiver that successfully
+    derived the session key can produce a valid MAC, giving the sender
+    cryptographic proof that the session key is genuinely shared.
+
+    This closes the G4b gap identified in the BAN logic analysis: Alice
+    previously had no evidence Bob possessed Ks.  Verifying this MAC
+    establishes Alice |= Bob |= Alice <--Ks--> Bob.
+    """
+    import hmac as _hmac
+    import hashlib
+    mac = _hmac.new(
+        aes_key,
+        challenge_nonce + b"sftp-hybrid-confirm",
+        hashlib.sha256,
+    ).digest()
+    return mac                     # 32 bytes
+
+
+def verify_ack_confirmation(
+    aes_key: bytes,
+    challenge_nonce: bytes,
+    mac_bytes: bytes,
+) -> bool:
+    """
+    Verify the key-confirmation MAC produced by the receiver.
+    Returns True if the MAC is valid (constant-time comparison).
+    """
+    import hmac as _hmac
+    import hashlib
+    expected = _hmac.new(
+        aes_key,
+        challenge_nonce + b"sftp-hybrid-confirm",
+        hashlib.sha256,
+    ).digest()
+    return _hmac.compare_digest(expected, mac_bytes)
+
+
 def build_error(message: str) -> bytes:
     """ERROR payload — a UTF-8 error description."""
     return message.encode("utf-8")
